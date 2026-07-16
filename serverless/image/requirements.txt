@@ -1,0 +1,8 @@
+runpod>=1.7.0
+httpx>=0.27
+pillow>=10.0
+# Face compliance filter (~500 MB)
+insightface>=0.7.3
+onnxruntime-gpu>=1.19
+# Logo/flag compliance filter (~150 MB)
+open_clip_torch>=2.24

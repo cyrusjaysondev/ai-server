@@ -1,0 +1,1 @@
+-e /workspace/runpod-slim/ComfyUI/custom_nodes/ai-gen-api-v2

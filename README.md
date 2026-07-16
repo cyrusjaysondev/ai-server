@@ -63,7 +63,7 @@ Click Deploy. SSH/Jupyter/ComfyUI come up via `/start.sh` but `:7860` stays
 SSH in) and run these as **two separate commands** (press Enter after each):
 
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh
 ```
 ```bash
 bash /tmp/setup.sh
@@ -345,7 +345,7 @@ grep "ai-gen-api-bootstrap" /workspace/comfyui.log
 If the file is missing (network volume was wiped or the pod was created with a
 different volume), re-run setup:
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/setup.sh && bash /tmp/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh && bash /tmp/setup.sh
 ```
 If the file is present but ComfyUI didn't log the line, ComfyUI may not have
 loaded the node. Tail `/workspace/comfyui.log` while restarting the pod to see
@@ -354,7 +354,7 @@ the import sequence.
 ### main.py failed to download
 ```bash
 wget -O /workspace/api/main.py \
-  "https://raw.githubusercontent.com/cyrusjaysondev/ai-gen-api-v2/main/main.py"
+  "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/main.py"
 ```
 
 ### ComfyUI not starting
@@ -416,6 +416,3 @@ cd /workspace/runpod-slim/ComfyUI && \
                          # rely on patching it. Auto-recovery happens via
                          # the ComfyUI bootstrap custom node instead.
 ```
-# ai-server
-# ai-server
-# ai-server
