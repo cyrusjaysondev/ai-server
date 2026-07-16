@@ -640,6 +640,12 @@ if [ ! -f /workspace/api/config.env ]; then
 fi
 source /workspace/api/config.env
 
+# ComfyUI 0.26.x validates VAELoader by listing both vae and vae_approx.
+# Some base images do not ship the category folder, and folder_paths raises
+# FileNotFoundError before generation starts if the directory is missing.
+mkdir -p "$COMFY_ROOT/models/vae_approx"
+log "Ensured ComfyUI vae_approx model directory exists"
+
 if [ -z "$PYTHON" ] || [ -z "$COMFY_ROOT" ]; then
   log "ERROR: PYTHON or COMFY_ROOT not set in config.env"
   exit 1
