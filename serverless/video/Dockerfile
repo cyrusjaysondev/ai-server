@@ -37,6 +37,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 RUN command -v ffmpeg >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*)
 
 COPY workflows.py /app/workflows.py
+COPY face_targeting.py /app/face_targeting.py
 # Optional input-face validation. InsightFace weights stay on the network
 # volume and are initialized only when require_detectable_face=true.
 COPY safety.py /app/safety.py

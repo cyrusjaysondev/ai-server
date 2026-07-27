@@ -18,7 +18,9 @@ from workflows import (
     LTX_ASPECT_RATIOS,
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
+    MULTI_FACE_SWAP_ORDERS,
     build_flux_i2i_workflow,
+    build_flux_multi_face_swap_workflow,
     build_t2i_workflow,
     build_ltx_i2v_workflow,
     build_ltx_lipdub_workflow,
@@ -31,6 +33,7 @@ from workflows import (
     get_flux_face_swap_workflow,
     ltx_base_nodes,
 )
+from face_targeting import normalize_target_face_indices, preserve_selected_faces
 
 # Compliance face filter (loaded lazily on first face_filter=true request).
 # Module exists even if insightface is uninstalled — it'll raise a clear
@@ -55,7 +58,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.2.0"
+API_VERSION = "2.3.0"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -607,6 +610,33 @@ async def _preserve_body_inplace(image_path, template_path: str, *, job_id: str)
         return False
 
 
+async def _preserve_selected_faces_inplace(
+    image_path,
+    template_path: str,
+    *,
+    job_id: str,
+    face_order: str,
+    target_face_indices: list[int],
+) -> bool:
+    """Keep every unselected person and all non-head pixels exactly unchanged."""
+    if face_safety is None or not hasattr(face_safety, "get_face_bboxes"):
+        print(f"[{job_id}] preserve-selected-faces: detector unavailable")
+        return False
+    try:
+        preserved, message = preserve_selected_faces(
+            image_path,
+            template_path,
+            face_order=face_order,
+            target_face_indices=target_face_indices,
+            detect_face_bboxes=face_safety.get_face_bboxes,
+        )
+        print(f"[{job_id}] preserve-selected-faces: {message}")
+        return preserved
+    except Exception as exc:
+        print(f"[{job_id}] preserve-selected-faces failed: {exc}")
+        return False
+
+
 async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
@@ -628,7 +658,11 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   refine_guidance: float = 4.0,
                   refine_lora: float = 1.0,
                   preserve_body: bool = False,
-                  preserve_body_template: str | None = None):
+                  preserve_body_template: str | None = None,
+                  preserve_face_selection: bool = False,
+                  preserve_face_template: str | None = None,
+                  preserve_face_order: str = "left-to-right",
+                  preserve_face_indices: list[int] | None = None):
     """Generic ComfyUI job runner.
 
     ── output_face_filter / output_logo_filter ──
@@ -727,6 +761,28 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 await _preserve_body_inplace(path, preserve_body_template, job_id=job_id)
                             except Exception as _pb:
                                 print(f"[{job_id}] preserve-body call raised (ignored): {_pb}")
+
+                        # FLUX regenerates the full frame. For group templates,
+                        # deliver only explicitly selected heads over the exact
+                        # original template pixels.
+                        if preserve_face_selection and is_image_output and preserve_face_template:
+                            selected_indices = preserve_face_indices or [0]
+                            preserved = await _preserve_selected_faces_inplace(
+                                path,
+                                preserve_face_template,
+                                job_id=job_id,
+                                face_order=preserve_face_order,
+                                target_face_indices=selected_indices,
+                            )
+                            if not preserved:
+                                path.unlink(missing_ok=True)
+                                jobs[job_id] = {
+                                    **jobs[job_id],
+                                    "status": "failed",
+                                    "error": "Could not isolate the selected template face. Please try another template.",
+                                    "failed_at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                return
 
                         # ── OUTPUT-SIDE FACE FILTER ──────────────────
                         # Scan the generated image against the blocklist
@@ -1004,6 +1060,13 @@ WORKFLOW_CATALOG = [
         "inputs": ["target.png", "face.png"],
     },
     {
+        "id": "multi-face-swap",
+        "label": "FLUX multi-person face swap",
+        "endpoint": "/flux/multi-face-swap",
+        "media": "image",
+        "inputs": ["target.png", "face-1.png", "face-2.png (optional)"],
+    },
+    {
         "id": "image-to-image",
         "label": "FLUX image editing",
         "endpoint": "/flux/i2i",
@@ -1047,6 +1110,13 @@ def _sample_workflow(workflow_id: str) -> dict:
             "target.png", "face.png", seed,
             megapixels=1.0, steps=4, cfg=1.0, guidance=4.0,
             lora_strength=1.0,
+        )
+    if workflow_id == "multi-face-swap":
+        return build_flux_multi_face_swap_workflow(
+            "target.png", ["face-1.png", "face-2.png"], seed,
+            face_order="left-to-right", megapixels=1.0, steps=4,
+            cfg=1.0, guidance=4.0, lora_strength=1.0,
+            target_face_indices=[0, 1],
         )
     if workflow_id == "image-to-image":
         return build_flux_i2i_workflow(
@@ -2282,6 +2352,169 @@ async def flux_face_swap(
 
 
 # ─────────────────────────────────────────────
+# FLUX.2 Klein 9B Multi-Person Face Swap
+# One template + one or two independently mapped user identities.
+# ─────────────────────────────────────────────
+
+@app.post("/flux/multi-face-swap")
+async def flux_multi_face_swap(
+    background_tasks: BackgroundTasks,
+    target_image: UploadFile = File(..., description="Base/template image containing the people to personalize"),
+    face_images: list[UploadFile] = File(..., description="One or two source face photos, repeated in mapping order"),
+    face_order: str = Form("left-to-right", description="Target-person ordering: left-to-right | right-to-left | top-to-bottom | bottom-to-top | largest-first"),
+    target_face_indices: str = Form("", description="Comma-separated zero-based target slots aligned with face_images, e.g. 1 for the second person or 0,1 for both"),
+    prompt: str | None = Form(None, description="Optional template-specific instruction appended to the protected identity-mapping prompt"),
+    seed: int = Form(-1),
+    megapixels: float = Form(2.0, description="Total output resolution in megapixels (0.5–4.0)"),
+    aspect_ratio: str = Form("original", description="Output aspect ratio: original | 1:1 | 16:9 | 9:16 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
+    steps: int = Form(4),
+    cfg: float = Form(1.0),
+    guidance: float = Form(4.0),
+    lora_strength: float = Form(1.0),
+    face_filter: bool = Form(True, description="Reject blocked identities in user uploads and the generated output"),
+    logo_filter: bool = Form(True, description="Reject blocked logos/flags in inputs and the generated output"),
+    watermark: str | None = Form(None, description="Optional text watermark for the generated image"),
+    watermark_image: bool = Form(False, description="Optionally add the configured logo watermark"),
+    require_detectable_face: bool = Form(True, description="Reject each face_images upload unless it contains a clear human face"),
+):
+    if len(face_images) not in (1, 2):
+        raise HTTPException(422, detail={
+            "error": "invalid_face_count",
+            "reason": f"face_images must contain 1 or 2 files; received {len(face_images)}.",
+            "received": len(face_images),
+            "minimum": 1,
+            "maximum": 2,
+        })
+    if face_order not in MULTI_FACE_SWAP_ORDERS:
+        raise HTTPException(400, detail={
+            "error": "invalid_face_order",
+            "reason": f"Invalid face_order '{face_order}'.",
+            "valid_values": list(MULTI_FACE_SWAP_ORDERS),
+        })
+    try:
+        parsed_target_indices = normalize_target_face_indices(
+            target_face_indices,
+            len(face_images),
+        )
+    except ValueError as exc:
+        raise HTTPException(422, detail={
+            "error": "invalid_target_face_indices",
+            "reason": str(exc),
+        }) from exc
+    if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
+        raise HTTPException(
+            400,
+            f"Invalid aspect_ratio '{aspect_ratio}'. Valid values: original, {', '.join(ASPECT_RATIOS)}",
+        )
+    if not 0.5 <= megapixels <= 4.0:
+        raise HTTPException(400, "megapixels must be between 0.5 and 4.0")
+    if prompt is not None and len(prompt) > 2000:
+        raise HTTPException(400, "prompt must be 2000 characters or fewer")
+
+    target_bytes = await target_image.read()
+    face_bytes_list = [await image.read() for image in face_images]
+    if not target_bytes:
+        raise HTTPException(422, detail={
+            "error": "empty_upload",
+            "reason": "target_image is empty.",
+        })
+    for index, face_bytes in enumerate(face_bytes_list):
+        if not face_bytes:
+            raise HTTPException(422, detail={
+                "error": "empty_upload",
+                "reason": f"face_images[{index}] is empty.",
+                "image_index": index,
+            })
+
+    job_id = str(uuid.uuid4())
+    face_inputs = [
+        (face_bytes, f"face_images[{index}]")
+        for index, face_bytes in enumerate(face_bytes_list)
+    ]
+    all_inputs = [(target_bytes, "target_image"), *face_inputs]
+    _require_detectable_face(
+        "/flux/multi-face-swap",
+        require_detectable_face,
+        face_inputs,
+    )
+    _apply_face_filter(
+        "/flux/multi-face-swap",
+        job_id,
+        face_filter,
+        all_inputs,
+    )
+    _apply_logo_filter(
+        "/flux/multi-face-swap",
+        job_id,
+        logo_filter,
+        all_inputs,
+    )
+
+    if aspect_ratio != "original":
+        w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+        target_w, target_h = compute_dimensions(w_ratio, h_ratio, megapixels)
+        target_bytes = crop_to_aspect(target_bytes, target_w, target_h)
+
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    target_filename = f"flux_multi_target_{uuid.uuid4().hex}.png"
+    face_filenames = [
+        f"flux_multi_face_{uuid.uuid4().hex}_{index}.png"
+        for index in range(len(face_bytes_list))
+    ]
+    target_path = INPUT_DIR / target_filename
+    face_paths = [INPUT_DIR / filename for filename in face_filenames]
+    target_path.write_bytes(target_bytes)
+    for path, face_bytes in zip(face_paths, face_bytes_list):
+        path.write_bytes(face_bytes)
+
+    workflow = build_flux_multi_face_swap_workflow(
+        target_filename,
+        face_filenames,
+        seed,
+        face_order=face_order,
+        prompt=prompt,
+        megapixels=megapixels,
+        steps=steps,
+        cfg=cfg,
+        guidance=guidance,
+        lora_strength=lora_strength,
+        target_face_indices=parsed_target_indices,
+    )
+
+    jobs[job_id] = {
+        "status": "queued",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "face_count": len(face_images),
+        "face_order": face_order,
+        "target_face_indices": parsed_target_indices,
+    }
+    background_tasks.add_task(
+        run_job,
+        job_id,
+        workflow,
+        [str(target_path), *[str(path) for path in face_paths]],
+        watermark,
+        watermark_image,
+        output_face_filter=face_filter,
+        output_logo_filter=logo_filter,
+        output_endpoint="/flux/multi-face-swap",
+        preserve_face_selection=True,
+        preserve_face_template=str(target_path),
+        preserve_face_order=face_order,
+        preserve_face_indices=parsed_target_indices,
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "flux2-klein-9b",
+        "face_count": len(face_images),
+        "face_order": face_order,
+        "target_face_indices": parsed_target_indices,
+        **_job_links(job_id),
+    }
+
+
+# ─────────────────────────────────────────────
 # FLUX.2 Klein 9B Image-to-Image (multi-reference editing)
 # Up to 5 reference images — each one feeds a ReferenceLatent chained
 # onto the prompt's conditioning. Output dimensions default to the first
@@ -2853,7 +3086,7 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
     import os
     import subprocess
 
-    api_repo = os.environ.get("API_REPO", "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main")
+    api_repo = os.environ.get("API_REPO", "https://raw.githubusercontent.com/cyrus688/ai-server/main")
     api_dir = Path("/workspace/api")
     api_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2861,6 +3094,7 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
     for filename in (
         "main.py",
         "workflows.py",
+        "face_targeting.py",
         "image_output.py",
         "safety.py",
         "logo_safety.py",

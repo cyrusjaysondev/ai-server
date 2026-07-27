@@ -25,11 +25,12 @@ import sys
 import urllib.request
 from pathlib import Path
 
-API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main"
+API_REPO_RAW = "https://raw.githubusercontent.com/cyrus688/ai-server/main"
 API_DIR = Path("/workspace/api")
 FILES_TO_REFRESH = (
     "main.py",
     "workflows.py",
+    "face_targeting.py",
     "image_output.py",
     "safety.py",
     "logo_safety.py",

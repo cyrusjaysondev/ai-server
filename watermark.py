@@ -62,7 +62,7 @@ _CAPTION_FONT_WEIGHT = 600  # EB Garamond is a variable font — pin SemiBold fo
 # where setup.sh hasn't run the asset step yet.
 LOGO_PATH = Path("/workspace/assets/metfone_genai_watermark.png")
 LOGO_URL = (
-    "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/"
+    "https://raw.githubusercontent.com/cyrus688/ai-server/"
     "main/assets/metfone_genai_watermark.png"
 )
 

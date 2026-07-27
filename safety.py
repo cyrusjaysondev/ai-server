@@ -516,12 +516,13 @@ def _ensure_app():
     return _CACHED_APP
 
 
-def get_largest_face_bbox(image_bytes: bytes):
-    """Largest detected face as (x1, y1, x2, y2) integer pixel coords, or None.
+def get_face_bboxes(image_bytes: bytes):
+    """All detected faces as integer ``(x1, y1, x2, y2)`` boxes.
 
     Reuses the same detector + preprocessing-fallback chain as the blocklist
     filter, but only returns geometry (no identity matching). Used by the
-    optional 2nd-pass face refiner. Never raises."""
+    face-swap compositors. Never raises.
+    """
     try:
         import io
         import numpy as np
@@ -532,13 +533,25 @@ def get_largest_face_bbox(image_bytes: bytes):
         pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         faces, _, _ = _detect_with_fallbacks(app, pil, np=np, label_for_log="refine")
         if not faces:
-            return None
-        f = max(faces, key=lambda fc: (fc.bbox[2] - fc.bbox[0]) * (fc.bbox[3] - fc.bbox[1]))
-        x1, y1, x2, y2 = (int(round(float(v))) for v in f.bbox)
-        return (x1, y1, x2, y2)
+            return []
+        return [
+            tuple(int(round(float(value))) for value in face.bbox)
+            for face in faces
+        ]
     except Exception as e:
         print(f"[face-refine] bbox detection failed: {e}")
+        return []
+
+
+def get_largest_face_bbox(image_bytes: bytes):
+    """Largest detected face as integer coordinates, or ``None``."""
+    bboxes = get_face_bboxes(image_bytes)
+    if not bboxes:
         return None
+    return max(
+        bboxes,
+        key=lambda box: (box[2] - box[0]) * (box[3] - box[1]),
+    )
 
 
 def get_status() -> dict:

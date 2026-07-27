@@ -2,7 +2,7 @@
 
 Step-by-step deployment of the two RunPod serverless endpoints:
 
-- **Image endpoint** (`t2i`, `flux/face-swap`, `flux/i2i`) — FLUX.2 Klein 9B
+- **Image endpoint** (`t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i`) — FLUX.2 Klein 9B
 - **Video endpoint** (`ltx/i2v`, `ltx/t2v`) — LTX-2.3 22B
 
 `face-animate` is **client-orchestrated**: call image first, feed the result
@@ -90,7 +90,7 @@ bash setup.sh    # safe to re-run; skips files that match HF sizes
 On your build machine (laptop or CPU pod):
 
 ```bash
-git clone https://github.com/cyrusjaysondev/ai-server.git
+git clone https://github.com/cyrus688/ai-server.git
 cd ai-gen-api-v2
 ```
 
@@ -436,7 +436,7 @@ ComfyUI is failing to boot. Most common causes:
 ### Handler returns `{"error": "unknown endpoint 'foo'"}`
 
 `input.endpoint` must be exactly one of:
-- Image worker: `t2i`, `flux/face-swap`, or `flux/i2i`
+- Image worker: `t2i`, `flux/face-swap`, `flux/multi-face-swap`, or `flux/i2i`
 - Video worker: `ltx/i2v` or `ltx/t2v`
 
 No leading slash. Case-sensitive.

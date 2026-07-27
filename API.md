@@ -13,6 +13,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | GET | `/health` | Health check |
 | POST | `/t2i` | Text to image (FLUX.2 Klein 9B) |
 | POST | `/flux/face-swap` | Head / face swap (FLUX.2 Klein 9B) |
+| POST | `/flux/multi-face-swap` | One- or two-person face swap (FLUX.2 Klein 9B) |
 | POST | `/flux/i2i` | Multi-reference image editing — 1 to 5 input images (FLUX.2 Klein 9B) |
 | GET | `/admin/blocklist` | List blocked face identities (admin auth) |
 | POST | `/admin/blocklist` | Upload a face to block |
@@ -271,6 +272,67 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
   -F "aspect_ratio=9:16" \
   -F "megapixels=2.0"
 ```
+
+---
+
+## POST /flux/multi-face-swap — One- or Two-Person Face Swap
+
+Personalize a group/couple template with one or two user face photos. The
+template is image 1 internally; repeated `face_images` uploads become images
+2–3. Each upload maps to the same-position entry in `target_face_indices`.
+
+Target slot `0` is the first person under `face_order`; slot `1` is the second.
+Either slot can be used alone. The delivered image is composited over the
+original template so unselected people and all pixels outside selected head
+regions remain unchanged. To use the same identity for both people, upload the
+same photo twice.
+
+### Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `target_image` | file | **required** | Template containing the people to personalize |
+| `face_images` | file[] | **required** | One or two files; repeat the multipart field in target mapping order |
+| `face_order` | string | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `target_face_indices` | comma-separated ints | upload order (`0` or `0,1`) | One distinct `0` or `1` per `face_images` upload; use `1` to replace only the second person |
+| `prompt` | string \| null | `null` | Optional template-specific instruction appended after the protected mapping/preservation prompt; max 2,000 characters |
+| `aspect_ratio` | string | `original` | Output aspect ratio; same options as `/flux/face-swap` |
+| `megapixels` | float | `2.0` | Total output resolution in megapixels (0.5–4.0) |
+| `seed` | int | `-1` (random) | Set for reproducible results |
+| `steps` | int | `4` | Inference steps |
+| `cfg` | float | `1.0` | CFG scale |
+| `guidance` | float | `4.0` | FLUX guidance strength |
+| `lora_strength` | float | `1.0` | BFS head-swap LoRA strength |
+| `require_detectable_face` | bool | `true` | Every `face_images` file must contain a clear human face |
+| `face_filter` | bool | `true` | Reject blocked identities in inputs and output |
+| `logo_filter` | bool | `true` | Reject blocked logos/flags in inputs and output |
+| `watermark` | string \| null | `null` | Optional text watermark |
+| `watermark_image` | bool | `false` | Optionally apply the configured logo watermark |
+
+### Two-person example
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.jpg" \
+  -F "face_images=@left_person.jpg" \
+  -F "face_images=@right_person.jpg" \
+  -F "face_order=left-to-right" \
+  -F "target_face_indices=0,1" \
+  -F "aspect_ratio=9:16"
+```
+
+### One-person example
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.jpg" \
+  -F "face_images=@replacement.jpg" \
+  -F "face_order=left-to-right" \
+  -F "target_face_indices=1"
+```
+
+The second example replaces only the second (rightmost) person and preserves
+the first person exactly.
 
 ---
 

@@ -3,7 +3,7 @@
 # AI Gen API v2 — Container Start Command entrypoint
 #
 # Usage (RunPod template → Container Start Command):
-#   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/boot.sh && bash /tmp/boot.sh"
+#   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/boot.sh && bash /tmp/boot.sh"
 #
 # Why this wrapper: RunPod's "Container Start Command" field replaces
 # the image's CMD. runpod/comfyui:latest ships /start.sh as CMD — that's
@@ -19,7 +19,7 @@ set -u
 
 log() { echo "[boot $(date '+%H:%M:%S')] $1"; }
 
-SETUP_URL="https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh"
+SETUP_URL="https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh"
 
 log "running /start.sh in background (SSH / JupyterLab / ComfyUI)"
 /start.sh &

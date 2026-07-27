@@ -10,9 +10,13 @@ Keep this file dependency-light: stdlib + Pillow only. No FastAPI, no runpod SDK
 no httpx — those are imported by the callers.
 """
 
+from __future__ import annotations
+
 import io
 import math
 from PIL import Image
+
+from face_targeting import normalize_target_face_indices
 
 
 # ─────────────────────────────────────────────
@@ -92,9 +96,65 @@ DEFAULT_FLUX_PROMPT = """head_swap: Use image 1 as the base image, preserving it
 Match the original head size, face-to-body ratio, neck thickness, shoulder alignment, and camera distance so proportions remain natural and unchanged.
 Adapt the inserted head to the lighting of image 1 by matching light direction, intensity, softness, color temperature, shadows, and highlights, with no independent relighting.
 Preserve the identity of image 2, including hair texture, eye color, nose structure, facial proportions, and skin details.
-Match the pose and expression from image 1, including head tilt, rotation, eye direction, gaze, micro-expressions, and lip position.
+Match the pose and expression from image 1, including head tilt, rotation, eye direction, gaze, micro-expressions, and lip position. When image 1 and image 2 show the same side-view or three-quarter angle, preserve that matching angle exactly: keep the source person's profile silhouette, visible-eye count, nose and chin contour, ear placement, and hairline. Never rotate a side-view reference into a front-facing face, mirror it, or invent features hidden by the camera angle.
 Ensure seamless neck and jaw blending, consistent skin tone, realistic shadow contact, natural skin texture, and uniform sharpness.
 Photorealistic, high quality, sharp details, 4K."""
+
+MULTI_FACE_SWAP_ORDERS = {
+    "left-to-right": "Order the people in image 1 from left to right.",
+    "right-to-left": "Order the people in image 1 from right to left.",
+    "top-to-bottom": "Order the people in image 1 from top to bottom.",
+    "bottom-to-top": "Order the people in image 1 from bottom to top.",
+    "largest-first": "Order the people in image 1 by visible face size, largest face first.",
+}
+
+
+def build_multi_face_swap_prompt(face_count: int, face_order: str = "left-to-right",
+                                 extra_prompt: str = None,
+                                 target_face_indices: list[int] | None = None) -> str:
+    """Build an explicit identity-to-person mapping for a group template.
+
+    Image 1 is always the CMS-managed template. Images 2 and 3 are user face
+    references. With one user photo, only its selected target slot is changed
+    and every other face is preserved. With two, each uploaded face maps to
+    its corresponding selected target slot.
+    """
+    if face_count not in (1, 2):
+        raise ValueError(f"multi-face swap requires 1 or 2 face images, got {face_count}")
+    if face_order not in MULTI_FACE_SWAP_ORDERS:
+        valid = ", ".join(MULTI_FACE_SWAP_ORDERS)
+        raise ValueError(f"invalid face_order '{face_order}'; valid: {valid}")
+
+    target_indices = normalize_target_face_indices(target_face_indices, face_count)
+    ordinal = ("first", "second")
+
+    if face_count == 1:
+        target = ordinal[target_indices[0]]
+        mapping = (
+            f"Replace only the {target} person's head and face with the identity "
+            "from image 2. Do not change the identity, face, or hair of any "
+            "other person in image 1."
+        )
+    else:
+        assignments = " ".join(
+            f"Replace the {ordinal[target_index]} person's head and face "
+            f"with the identity from image {source_index + 2}."
+            for source_index, target_index in enumerate(target_indices)
+        )
+        mapping = (
+            f"{assignments} Keep the two source identities separate: "
+            "never blend, average, merge, or swap them with each other."
+        )
+
+    prompt = f"""group_head_swap: Image 1 is the base/template image. Preserve its exact composition, environment, background, camera perspective, framing, body positions, clothing, hands, exposure, contrast, and lighting.
+{MULTI_FACE_SWAP_ORDERS[face_order]} {mapping}
+For every replaced person, preserve the source identity's facial structure, eyes, nose, mouth, skin details, and hair. Match the target person's original head size, face-to-body ratio, neck thickness, shoulder alignment, head pose, expression, gaze, and camera distance.
+Treat the target person's camera-facing angle as mandatory. When a source photo matches a target side-view or three-quarter angle, preserve that angle exactly, including the profile silhouette, visible-eye count, nose and chin contour, ear placement, and hairline. Do not frontalize, mirror, or reveal facial features hidden by the target camera angle.
+Adapt each inserted head independently to image 1's light direction, intensity, softness, color temperature, shadows, and highlights. Ensure seamless neck and jaw blending, realistic shadow contact, natural skin texture, and uniform sharpness.
+Do not add or remove people. Do not change bodies, poses, clothing, accessories, hands, or the background. Photorealistic, high quality, sharp details, 4K."""
+    if extra_prompt and extra_prompt.strip():
+        prompt = f"{prompt}\nTemplate-specific instruction: {extra_prompt.strip()}"
+    return prompt
 
 
 def get_flux_face_swap_workflow(target_filename: str, face_filename: str, seed: int,
@@ -236,6 +296,35 @@ def build_flux_i2i_workflow(image_filenames: list, prompt: str, seed: int,
     }}
 
     return nodes
+
+
+def build_flux_multi_face_swap_workflow(target_filename: str, face_filenames: list,
+                                        seed: int, face_order: str = "left-to-right",
+                                        prompt: str = None, megapixels: float = 2.0,
+                                        steps: int = 4, cfg: float = 1.0,
+                                        guidance: float = 4.0,
+                                        lora_strength: float = 1.0,
+                                        target_face_indices: list[int] | None = None) -> dict:
+    """Build a one- or two-person face-swap workflow using FLUX references."""
+    face_count = len(face_filenames)
+    mapped_prompt = build_multi_face_swap_prompt(
+        face_count,
+        face_order,
+        prompt,
+        target_face_indices,
+    )
+    workflow = build_flux_i2i_workflow(
+        [target_filename, *face_filenames],
+        mapped_prompt,
+        seed,
+        megapixels=megapixels,
+        steps=steps,
+        cfg=cfg,
+        guidance=guidance,
+        lora_strength=lora_strength,
+    )
+    workflow["70"]["inputs"]["filename_prefix"] = f"images/flux_multi_face_swap_{seed}"
+    return workflow
 
 
 # ─────────────────────────────────────────────

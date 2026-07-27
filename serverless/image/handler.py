@@ -4,6 +4,7 @@ RunPod serverless handler — Image worker (FLUX.2 Klein 9B).
 Endpoints supported via `event["input"]["endpoint"]`:
   - "t2i"            text-to-image
   - "flux/face-swap" face / head swap (2 reference images: target body + face)
+  - "flux/multi-face-swap" group face swap (target + one or two faces)
   - "flux/i2i"       multi-reference image editing (1–5 reference images + prompt)
 
 Models read from the network volume at /runpod-volume/runpod-slim/ComfyUI/models
@@ -61,12 +62,15 @@ import runpod
 sys.path.insert(0, "/app")
 from workflows import (
     ASPECT_RATIOS,
+    MULTI_FACE_SWAP_ORDERS,
     build_flux_i2i_workflow,
+    build_flux_multi_face_swap_workflow,
     build_t2i_workflow,
     compute_dimensions,
     crop_to_aspect,
     get_flux_face_swap_workflow,
 )
+from face_targeting import normalize_target_face_indices, preserve_selected_faces
 from image_output import optimize_image_file
 try:
     import safety as face_safety
@@ -435,6 +439,142 @@ async def run_flux_face_swap(inp: dict, job_id: str) -> dict:
         (INPUT_DIR / face_filename).unlink(missing_ok=True)
 
 
+async def run_flux_multi_face_swap(inp: dict, job_id: str) -> dict:
+    if not inp.get("target_image_b64"):
+        raise ValueError("'target_image_b64' is required for flux/multi-face-swap")
+    faces_b64 = inp.get("face_images_b64")
+    if not isinstance(faces_b64, list) or len(faces_b64) not in (1, 2):
+        count = len(faces_b64) if isinstance(faces_b64, list) else 0
+        raise ValueError(
+            f"'face_images_b64' must contain 1 or 2 images for "
+            f"flux/multi-face-swap; received {count}"
+        )
+
+    face_order = str(inp.get("face_order", "left-to-right"))
+    if face_order not in MULTI_FACE_SWAP_ORDERS:
+        raise ValueError(
+            f"invalid face_order '{face_order}'; valid: "
+            f"{', '.join(MULTI_FACE_SWAP_ORDERS)}"
+        )
+    target_face_indices = normalize_target_face_indices(
+        inp.get("target_face_indices"),
+        len(faces_b64),
+    )
+    aspect_ratio = str(inp.get("aspect_ratio", "original"))
+    if aspect_ratio != "original" and aspect_ratio not in ASPECT_RATIOS:
+        raise ValueError(
+            f"invalid aspect_ratio '{aspect_ratio}'; valid: original, "
+            f"{', '.join(ASPECT_RATIOS)}"
+        )
+    megapixels = float(inp.get("megapixels", 2.0))
+    if not 0.5 <= megapixels <= 4.0:
+        raise ValueError("megapixels must be between 0.5 and 4.0")
+    prompt = inp.get("prompt")
+    if prompt is not None and len(str(prompt)) > 2000:
+        raise ValueError("prompt must be 2000 characters or fewer")
+
+    seed = inp.get("seed", -1)
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    target_bytes = _decode_image_b64(inp["target_image_b64"], "target_image_b64")
+    face_bytes_list = [
+        _decode_image_b64(value, f"face_images_b64[{index}]")
+        for index, value in enumerate(faces_b64)
+    ]
+
+    face_inputs = [
+        (face_bytes, f"face_images_b64[{index}]")
+        for index, face_bytes in enumerate(face_bytes_list)
+    ]
+    inputs_for_filter = [(target_bytes, "target_image_b64"), *face_inputs]
+    _require_detectable_face(
+        _as_bool(inp.get("require_detectable_face", True)),
+        face_inputs,
+    )
+    _apply_face_filter(
+        "flux/multi-face-swap",
+        job_id,
+        _as_bool(inp.get("face_filter", True)),
+        inputs_for_filter,
+    )
+    _apply_logo_filter(
+        "flux/multi-face-swap",
+        job_id,
+        _as_bool(inp.get("logo_filter", True)),
+        inputs_for_filter,
+    )
+
+    if aspect_ratio != "original":
+        w_ratio, h_ratio = ASPECT_RATIOS[aspect_ratio]
+        target_w, target_h = compute_dimensions(w_ratio, h_ratio, megapixels)
+        target_bytes = crop_to_aspect(target_bytes, target_w, target_h)
+
+    target_filename = f"flux_multi_target_{uuid.uuid4().hex}.png"
+    face_filenames = [
+        f"flux_multi_face_{uuid.uuid4().hex}_{index}.png"
+        for index in range(len(face_bytes_list))
+    ]
+    target_path = INPUT_DIR / target_filename
+    face_paths = [INPUT_DIR / filename for filename in face_filenames]
+    staged_paths = [target_path, *face_paths]
+    try:
+        target_path.write_bytes(target_bytes)
+        for path, face_bytes in zip(face_paths, face_bytes_list):
+            path.write_bytes(face_bytes)
+
+        workflow = build_flux_multi_face_swap_workflow(
+            target_filename,
+            face_filenames,
+            seed,
+            face_order=face_order,
+            prompt=str(prompt) if prompt else None,
+            megapixels=megapixels,
+            steps=int(inp.get("steps", 4)),
+            cfg=float(inp.get("cfg", 1.0)),
+            guidance=float(inp.get("guidance", 4.0)),
+            lora_strength=float(inp.get("lora_strength", 1.0)),
+            target_face_indices=target_face_indices,
+        )
+
+        started = time.time()
+        filename, src = await submit_and_wait(workflow)
+        dest = _stage_output_to_volume(filename, src, job_id)
+        if face_safety is None or not hasattr(face_safety, "get_face_bboxes"):
+            raise RuntimeError("face detector unavailable for selected-person preservation")
+        preserved, preserve_message = preserve_selected_faces(
+            dest,
+            target_path,
+            face_order=face_order,
+            target_face_indices=target_face_indices,
+            detect_face_bboxes=face_safety.get_face_bboxes,
+        )
+        if not preserved:
+            dest.unlink(missing_ok=True)
+            raise RuntimeError(preserve_message)
+        wm_err = _apply_watermark(
+            dest,
+            inp.get("watermark"),
+            _as_bool(inp.get("watermark_image", False)),
+        )
+        dest, delivery = _prepare_delivery_image(dest)
+        result = {
+            "image_path": str(dest),
+            "filename": dest.name,
+            "size_bytes": dest.stat().st_size,
+            "image_delivery": delivery,
+            "seed": seed,
+            "face_count": len(face_bytes_list),
+            "face_order": face_order,
+            "target_face_indices": target_face_indices,
+            "duration_seconds": round(time.time() - started, 2),
+        }
+        if wm_err:
+            result["watermark_warning"] = wm_err
+        return result
+    finally:
+        for path in staged_paths:
+            path.unlink(missing_ok=True)
+
+
 async def run_flux_i2i(inp: dict, job_id: str) -> dict:
     images_b64 = inp.get("images_b64")
     if not isinstance(images_b64, list) or not (1 <= len(images_b64) <= 5):
@@ -510,6 +650,7 @@ async def run_flux_i2i(inp: dict, job_id: str) -> dict:
 ENDPOINTS = {
     "t2i": run_t2i,
     "flux/face-swap": run_flux_face_swap,
+    "flux/multi-face-swap": run_flux_multi_face_swap,
     "flux/i2i": run_flux_i2i,
 }
 

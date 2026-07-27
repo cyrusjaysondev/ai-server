@@ -14,7 +14,7 @@ Two RunPod serverless endpoints share the same network volume that the pod uses:
 
 | Endpoint | Workflows | Image size | Models loaded from volume |
 |---|---|---|---|
-| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap`, `flux/i2i` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
+| **Image** (`serverless/image/`) | `t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i` | ~6 GB (no weights baked in) | FLUX.2 Klein 9B + VAE + Qwen 3 + BFS LoRA |
 | **Video** (`serverless/video/`) | `ltx/i2v`, `ltx/t2v` | ~6 GB | LTX-2.3 22B + distilled LoRA + Gemma 12B + Gemma LoRA + upscaler |
 
 `face-animate` is **client-orchestrated**: call image first, then feed the
@@ -138,6 +138,38 @@ curl -X POST "$ENDPOINT" \
     }
   }"
 ```
+
+### Image / flux/multi-face-swap (one or two people)
+
+Supply one or two base64 face photos and an aligned `target_face_indices`
+array. Slot `0` is the first person under `face_order`; slot `1` is the
+second, so either person can be replaced alone. Unselected people are restored
+from the original template before delivery.
+
+```bash
+TARGET_B64=$(base64 -w0 couple-template.png)
+FACE_A_B64=$(base64 -w0 person-a.png)
+FACE_B_B64=$(base64 -w0 person-b.png)
+
+curl -X POST "$ENDPOINT" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"input\": {
+      \"endpoint\": \"flux/multi-face-swap\",
+      \"target_image_b64\": \"$TARGET_B64\",
+      \"face_images_b64\": [\"$FACE_A_B64\", \"$FACE_B_B64\"],
+      \"target_face_indices\": [0, 1],
+      \"face_order\": \"left-to-right\",
+      \"aspect_ratio\": \"original\",
+      \"megapixels\": 2.0
+    }
+  }"
+```
+
+`face_order` accepts `left-to-right`, `right-to-left`, `top-to-bottom`,
+`bottom-to-top`, or `largest-first`. An optional `prompt` adds a
+template-specific instruction without replacing the protected identity mapping.
 
 ### Image / flux/i2i (multi-reference editing, 1–5 images)
 

@@ -9,7 +9,7 @@
 # Python venv: /workspace/runpod-slim/ComfyUI/.venv-cu128/
 #
 # Set as start command in template overrides:
-#   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh && bash /tmp/setup.sh &"
+#   bash -c "wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh && bash /tmp/setup.sh &"
 #
 # Required env var (set in RunPod template):
 #   HF_TOKEN = your Hugging Face token
@@ -35,7 +35,7 @@ if ! flock -n 8; then
   exit 0
 fi
 
-API_REPO="https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main"
+API_REPO="https://raw.githubusercontent.com/cyrus688/ai-server/main"
 
 # ─────────────────────────────────────────────
 # Bind :7860 IMMEDIATELY with an install-progress server so the proxy
@@ -566,6 +566,11 @@ if [ ! -s "/workspace/api/workflows.py" ]; then
   log "  ERROR: Failed to download workflows.py (shared with serverless workers)"
   exit 1
 fi
+wget -q -O /workspace/api/face_targeting.py "${API_REPO}/face_targeting.py"
+if [ ! -s "/workspace/api/face_targeting.py" ]; then
+  log "  ERROR: Failed to download face_targeting.py"
+  exit 1
+fi
 wget -q -O /workspace/api/image_output.py "${API_REPO}/image_output.py"
 if [ ! -s "/workspace/api/image_output.py" ]; then
   log "  ERROR: Failed to download image_output.py"
@@ -583,7 +588,7 @@ wget -q -O /workspace/api/watermark.py "${API_REPO}/watermark.py"
 if [ ! -s "/workspace/api/watermark.py" ]; then
   log "  WARN: Failed to download watermark.py — watermark parameter will be a no-op"
 fi
-log "  main.py + workflows.py + image_output.py + safety.py + logo_safety.py + watermark.py downloaded (latest)"
+log "  main.py + workflows.py + face_targeting.py + image_output.py + safety.py + logo_safety.py + watermark.py downloaded (latest)"
 
 # Create blocklist dirs so admins know where files land
 mkdir -p /workspace/blocklist /workspace/blocklist_logos
@@ -754,7 +759,7 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | 
 # the loop turns a uvicorn-only restart into a real code deploy.
 fetch_api_code() {
   log "Fetching latest API code..."
-  for f in main.py workflows.py image_output.py safety.py logo_safety.py watermark.py; do
+  for f in main.py workflows.py face_targeting.py image_output.py safety.py logo_safety.py watermark.py; do
     wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
     if [ -s "/workspace/api/$f.new" ]; then
       mv "/workspace/api/$f.new" "/workspace/api/$f"

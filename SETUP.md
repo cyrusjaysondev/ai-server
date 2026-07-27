@@ -42,7 +42,7 @@ Before starting, you need:
    Generate one with: `python -c "import secrets; print(secrets.token_hex(32))"`
 4. Under **Container Start Command**, paste this **exactly** (single line):
    ```bash
-   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/boot.sh && bash /tmp/boot.sh"
+   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/boot.sh && bash /tmp/boot.sh"
    ```
 
    > ⚠️ If you leave this field **empty**, the pod will only run the image's default
@@ -119,7 +119,7 @@ If a couple of minutes pass and `/workspace/api_setup.log` shows **no new `AI Ge
 **Run `setup.sh` manually** — SSH in (or open a Jupyter terminal) and paste these as **two separate commands**, pressing Enter after each:
 
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh
 ```
 
 ```bash
@@ -323,7 +323,7 @@ die if the shell exits. `setsid nohup … </dev/null &` fully detaches.
 | GPU | RTX 5090 (32 GB) or A100 (80 GB) |
 | Volume | 200 GB (persistent across restarts) |
 | Ports | 7860 (API), 8188 (ComfyUI), 8888 (Jupyter) |
-| Start command | `bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/boot.sh && bash /tmp/boot.sh"` |
+| Start command | `bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/boot.sh && bash /tmp/boot.sh"` |
 
 ---
 
@@ -391,7 +391,7 @@ grep -c "AI Gen API v2 auto-start" /start.sh    # should print 2
 ```
 If the hook is missing, re-run setup to re-apply it (two separate commands):
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh
 ```
 ```bash
 bash /tmp/setup.sh
@@ -418,7 +418,7 @@ Two fixes:
    wrapping):
 
    ```
-   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/boot.sh && bash /tmp/boot.sh"
+   bash -c "wget -qO /tmp/boot.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/boot.sh && bash /tmp/boot.sh"
    ```
    Save the template. Next fresh pod deploys hands-off.
 

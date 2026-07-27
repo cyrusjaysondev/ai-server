@@ -28,9 +28,9 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main"
+API_REPO_RAW = "https://raw.githubusercontent.com/cyrus688/ai-server/main"
 API_DIR = Path("/workspace/api")
-FILES_TO_REFRESH = ("main.py", "workflows.py", "safety.py", "logo_safety.py", "watermark.py")
+FILES_TO_REFRESH = ("main.py", "workflows.py", "face_targeting.py", "safety.py", "logo_safety.py", "watermark.py")
 # Bump this suffix to force the refresh to re-run after a subsequent push.
 # We use a versioned marker so legit ComfyUI restarts after the work is
 # done don't trigger another uvicorn cycle.

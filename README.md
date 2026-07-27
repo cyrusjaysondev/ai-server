@@ -1,7 +1,7 @@
 # AI Gen API v2
 
 API on RunPod for:
-- **FLUX.2 Klein 9B** — text-to-image, head/face swap, multi-reference image editing (1–5 input images)
+- **FLUX.2 Klein 9B** — text-to-image, one- or two-person face swap, multi-reference image editing (1–5 input images)
 - **LTX 2.3 22B** — image-to-video, text-to-video, face-animate pipeline
 
 Two ways to run it:
@@ -9,7 +9,7 @@ Two ways to run it:
   FastAPI on `:7860`, models on `/workspace`. Pay per pod-second.
 - **Serverless mode** ([SERVERLESS_SETUP.md](SERVERLESS_SETUP.md) for step-by-step
   deploy, [serverless/README.md](serverless/README.md) for the API reference) —
-  split into an **image endpoint** (`t2i`, `flux/face-swap`, `flux/i2i`) and a **video
+  split into an **image endpoint** (`t2i`, `flux/face-swap`, `flux/multi-face-swap`, `flux/i2i`) and a **video
   endpoint** (`ltx/i2v`, `ltx/t2v`). Same models, mounted from the same network
   volume the pod uses. Pay per request, scale to zero.
 
@@ -63,7 +63,7 @@ Click Deploy. SSH/Jupyter/ComfyUI come up via `/start.sh` but `:7860` stays
 SSH in) and run these as **two separate commands** (press Enter after each):
 
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh
 ```
 ```bash
 bash /tmp/setup.sh
@@ -159,6 +159,36 @@ curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/face-swap \
 | `guidance` | 4.0 | FLUX guidance (2.0-6.0) |
 | `lora_strength` | 1.0 | Head swap LoRA strength (0.0-1.5) |
 | `watermark` | `null` | Optional bottom-right text overlay (e.g. `"AI"`). See [Output watermark](#output-watermark). |
+
+### Multi-Person Face Swap (FLUX)
+
+Upload the template first, then repeat `face_images` once or twice. Pair each
+upload with its zero-based template slot in `target_face_indices`; either
+person can be replaced alone. Unselected people are composited from the
+original template so their identities stay unchanged.
+
+```bash
+curl -X POST https://YOUR_POD_ID-7860.proxy.runpod.net/flux/multi-face-swap \
+  -F "target_image=@couple_template.png" \
+  -F "face_images=@person_a.png" \
+  -F "face_images=@person_b.png" \
+  -F "face_order=left-to-right" \
+  -F "target_face_indices=0,1"
+```
+
+**Parameters:**
+
+| Param | Default | Description |
+|-------|---------|-------------|
+| `target_image` | required | Template containing the people to personalize |
+| `face_images` | required | Repeat 1–2 times; upload order maps to target order |
+| `face_order` | `left-to-right` | `left-to-right`, `right-to-left`, `top-to-bottom`, `bottom-to-top`, or `largest-first` |
+| `target_face_indices` | upload order | Comma-separated target slots aligned with uploads: `0`, `1`, `0,1`, or `1,0` |
+| `prompt` | empty | Optional template-specific instruction appended to the protected mapping prompt |
+| `aspect_ratio` | `original` | Preserve the template ratio or select a supported output ratio |
+| `megapixels` | `2.0` | Total output resolution (0.5–4.0 MP) |
+| `steps` / `cfg` / `guidance` | `4` / `1.0` / `4.0` | FLUX inference controls |
+| `lora_strength` | `1.0` | BFS head-swap LoRA strength |
 
 ### Multi-reference Image Editing (FLUX)
 Send 1 to 5 reference images plus a prompt. The prompt drives the edit; the
@@ -345,7 +375,7 @@ grep "ai-gen-api-bootstrap" /workspace/comfyui.log
 If the file is missing (network volume was wiped or the pod was created with a
 different volume), re-run setup:
 ```bash
-wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/setup.sh && bash /tmp/setup.sh
+wget -qO /tmp/setup.sh https://raw.githubusercontent.com/cyrus688/ai-server/main/setup.sh && bash /tmp/setup.sh
 ```
 If the file is present but ComfyUI didn't log the line, ComfyUI may not have
 loaded the node. Tail `/workspace/comfyui.log` while restarting the pod to see
@@ -354,7 +384,7 @@ the import sequence.
 ### main.py failed to download
 ```bash
 wget -O /workspace/api/main.py \
-  "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/main.py"
+  "https://raw.githubusercontent.com/cyrus688/ai-server/main/main.py"
 ```
 
 ### ComfyUI not starting

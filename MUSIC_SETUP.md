@@ -67,7 +67,7 @@ Recommended pod for first build:
 Start command:
 
 ```bash
-bash -lc 'export MUSIC_RUN_API=true MUSIC_EAGER_LOAD=true MUSIC_PRELOAD_MODELS=true; curl -fsSL https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main/music/setup_music.sh | bash'
+bash -lc 'export MUSIC_RUN_API=true MUSIC_EAGER_LOAD=true MUSIC_PRELOAD_MODELS=true; curl -fsSL https://raw.githubusercontent.com/cyrus688/ai-server/main/music/setup_music.sh | bash'
 ```
 
 Environment variables:

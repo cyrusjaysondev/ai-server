@@ -30,6 +30,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Shared workflow builders (also used by pod-mode main.py)
 COPY workflows.py /app/workflows.py
+COPY face_targeting.py /app/face_targeting.py
 COPY image_output.py /app/image_output.py
 
 # Face-blocklist filter — imported lazily by the handler when face_filter=true.
