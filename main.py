@@ -87,13 +87,16 @@ POD_ID = os.environ.get("RUNPOD_POD_ID", "RUNPOD_POD_ID_PLACEHOLDER")
 BASE_URL = f"https://{POD_ID}-7860.proxy.runpod.net"
 COMFY_JOB_TIMEOUT_SECONDS = int(os.environ.get("COMFY_JOB_TIMEOUT_SECONDS", "900"))
 
-# Auto-detect ComfyUI root
-COMFY_ROOT = None
-for _p in ["/workspace/runpod-slim/ComfyUI", "/workspace/ComfyUI"]:
-    if Path(_p).exists():
-        COMFY_ROOT = Path(_p)
-        break
-if not COMFY_ROOT:
+# Allow local/staging smoke tests to point at a writable ComfyUI tree while
+# preserving the existing RunPod auto-detection and production default.
+_configured_comfy_root = os.environ.get("COMFY_ROOT", "").strip()
+COMFY_ROOT = Path(_configured_comfy_root) if _configured_comfy_root else None
+if COMFY_ROOT is None:
+    for _p in ["/workspace/runpod-slim/ComfyUI", "/workspace/ComfyUI"]:
+        if Path(_p).exists():
+            COMFY_ROOT = Path(_p)
+            break
+if COMFY_ROOT is None:
     COMFY_ROOT = Path("/workspace/ComfyUI")
 
 OUTPUT_DIR = COMFY_ROOT / "output"
