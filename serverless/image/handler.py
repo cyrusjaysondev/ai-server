@@ -69,8 +69,9 @@ from workflows import (
     compute_dimensions,
     crop_to_aspect,
     get_flux_face_swap_workflow,
+    normalize_target_face_indices,
+    preserve_selected_faces,
 )
-from face_targeting import normalize_target_face_indices, preserve_selected_faces
 from image_output import optimize_image_file
 try:
     import safety as face_safety

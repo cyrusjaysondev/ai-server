@@ -1,4 +1,8 @@
+import ast
 import unittest
+from pathlib import Path
+
+import workflows
 
 from workflows import (
     build_flux_multi_face_swap_workflow,
@@ -7,6 +11,16 @@ from workflows import (
 
 
 class MultiFaceSwapWorkflowTests(unittest.TestCase):
+    def test_workflows_module_is_safe_for_legacy_hot_refresh(self):
+        tree = ast.parse(Path(workflows.__file__).read_text())
+        imported_modules = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        self.assertNotIn("face_targeting", imported_modules)
+        self.assertTrue(callable(workflows.preserve_selected_faces))
+
     def test_one_face_maps_only_first_person(self):
         prompt = build_multi_face_swap_prompt(1, "right-to-left")
 

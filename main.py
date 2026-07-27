@@ -32,8 +32,9 @@ from workflows import (
     crop_to_aspect,
     get_flux_face_swap_workflow,
     ltx_base_nodes,
+    normalize_target_face_indices,
+    preserve_selected_faces,
 )
-from face_targeting import normalize_target_face_indices, preserve_selected_faces
 
 # Compliance face filter (loaded lazily on first face_filter=true request).
 # Module exists even if insightface is uninstalled — it'll raise a clear
