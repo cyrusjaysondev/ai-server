@@ -11,28 +11,38 @@ class BlocklistEnforcementTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tree = ast.parse(MAIN_PATH.read_text())
 
-    def test_server_enforcement_is_enabled(self):
-        assignment = next(
-            node
-            for node in self.tree.body
-            if isinstance(node, ast.Assign)
-            and any(
-                isinstance(target, ast.Name)
-                and target.id == "ENFORCE_FACE_BLOCKLIST"
-                for target in node.targets
-            )
-        )
-        self.assertIsInstance(assignment.value, ast.Constant)
-        self.assertIs(assignment.value.value, True)
-
-    def test_input_filter_overrides_caller_flag(self):
+    def test_input_filter_honors_disabled_flag(self):
         function = next(
             node
             for node in self.tree.body
             if isinstance(node, ast.FunctionDef)
             and node.name == "_apply_face_filter"
         )
-        override = next(
+        disabled_branch = next(
+            node
+            for node in function.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.UnaryOp)
+            and isinstance(node.test.op, ast.Not)
+            and isinstance(node.test.operand, ast.Name)
+            and node.test.operand.id == "face_filter"
+        )
+        self.assertTrue(any(isinstance(node, ast.Return) for node in disabled_branch.body))
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "log_bypass"
+            for node in ast.walk(disabled_branch)
+        ))
+
+    def test_input_filter_does_not_override_caller_flag(self):
+        function = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_apply_face_filter"
+        )
+        overrides = [
             node
             for node in function.body
             if isinstance(node, ast.Assign)
@@ -40,11 +50,10 @@ class BlocklistEnforcementTests(unittest.TestCase):
                 isinstance(target, ast.Name) and target.id == "face_filter"
                 for target in node.targets
             )
-        )
-        self.assertIsInstance(override.value, ast.Name)
-        self.assertEqual(override.value.id, "ENFORCE_FACE_BLOCKLIST")
+        ]
+        self.assertEqual(overrides, [])
 
-    def test_all_generated_output_checks_use_server_policy(self):
+    def test_generated_output_checks_honor_request_flag(self):
         output_filter_values = [
             keyword.value
             for node in ast.walk(self.tree)
@@ -53,9 +62,24 @@ class BlocklistEnforcementTests(unittest.TestCase):
             if keyword.arg == "output_face_filter"
         ]
         self.assertGreaterEqual(len(output_filter_values), 3)
+        self.assertTrue(any(
+            isinstance(value, ast.Attribute)
+            and isinstance(value.value, ast.Name)
+            and value.value.id == "req"
+            and value.attr == "face_filter"
+            for value in output_filter_values
+        ))
         self.assertTrue(all(
-            isinstance(value, ast.Name)
-            and value.id == "ENFORCE_FACE_BLOCKLIST"
+            (
+                isinstance(value, ast.Name)
+                and value.id == "face_filter"
+            )
+            or (
+                isinstance(value, ast.Attribute)
+                and isinstance(value.value, ast.Name)
+                and value.value.id == "req"
+                and value.attr == "face_filter"
+            )
             for value in output_filter_values
         ))
 
