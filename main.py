@@ -55,7 +55,12 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.2.0"
+API_VERSION = "2.2.1"
+
+# Blocked-face enforcement is a server-side compliance boundary. Keep the
+# request fields for backward compatibility, but never let a caller or stale
+# proxy disable checks for either uploaded inputs or generated outputs.
+ENFORCE_FACE_BLOCKLIST = True
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1350,11 +1355,8 @@ class T2IRequest(BaseModel):
     watermark_image: bool = False  # composite the Metfone GenAI logo at bottom-right
     # Output-side face filter — applied AFTER generation. /t2i has no input
     # image so this is the only way a blocked-identity prompt can be caught.
-    # Defaults ON (safe default, matching /flux/face-swap & /flux/i2i): callers
-    # may pass face_filter=false to skip (logged to
-    # /workspace/face_filter_bypass.log). The proxies now FORWARD the caller's
-    # value rather than forcing it, so this default is what protects callers
-    # that omit the flag.
+    # This field remains for wire compatibility, but the server always enforces
+    # the CMS-managed blocked-face list regardless of the submitted value.
     face_filter: bool = True
     # Output-side logo filter — same reasoning as face_filter but for
     # blocked logos/flags. Catches "draw the [logo] flag" prompts. Defaults ON.
@@ -1373,16 +1375,13 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
     )
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "queued", "created_at": datetime.now(timezone.utc).isoformat()}
-    # Pass face_filter / logo_filter down to run_job so it scans the OUTPUT
-    # before exposing the result URL. /t2i has no input image, so this is
-    # the ONLY safety check that runs for this endpoint.
-    if not req.face_filter and face_safety is not None:
-        face_safety.log_bypass(job_id, "/t2i", note="face_filter=false (output check skipped)")
+    # /t2i has no input image, so the mandatory output scan is its blocked-face
+    # enforcement point. The client flag is intentionally ignored.
     if not req.logo_filter and face_safety is not None:
         face_safety.log_bypass(job_id, "/t2i", note="logo_filter=false (output check skipped)")
     background_tasks.add_task(
         run_job, job_id, workflow, None, req.watermark, req.watermark_image,
-        output_face_filter=req.face_filter, output_logo_filter=req.logo_filter,
+        output_face_filter=ENFORCE_FACE_BLOCKLIST, output_logo_filter=req.logo_filter,
         output_endpoint="/t2i", caption=req.caption, caption_icon=req.caption_icon,
     )
     return {"job_id": job_id, "status": "queued", "model": "flux2-klein-9b", **_job_links(job_id)}
@@ -1390,20 +1389,16 @@ async def text_to_image(req: T2IRequest, background_tasks: BackgroundTasks):
 
 # ─────────────────────────────────────────────
 # Compliance helper — checks N input images against the blocklist.
-# Raises HTTPException(400) on the first blocked image. Returns silently
-# if the filter is disabled or no images match.
-#
-# `face_filter=False` is recorded to /workspace/face_filter_bypass.log for
-# audit purposes — anyone calling these endpoints with face_filter=false
-# leaves a trail.
+# Raises HTTPException(400) on the first blocked image. The caller-provided
+# flag is retained in endpoint contracts for compatibility but is ignored:
+# blocked-face checks are mandatory at the AI-server boundary.
 # ─────────────────────────────────────────────
 
 def _apply_face_filter(endpoint: str, job_id: str, face_filter: bool,
                        images_with_names: list) -> None:
     """images_with_names: list of (bytes, label) pairs. label is used in the error."""
+    face_filter = ENFORCE_FACE_BLOCKLIST
     if not face_filter:
-        if face_safety is not None:
-            face_safety.log_bypass(job_id, endpoint, note=f"face_filter=false, {len(images_with_names)} images")
         return
     if face_safety is None:
         raise HTTPException(503, "face filter requested but `safety` module unavailable (insightface not installed)")
@@ -1524,7 +1519,7 @@ async def ltx_image_to_video(
     caption_icon: str | None = Form(None, description="Optional zodiac sign for the caption (aries|taurus|gemini|cancer|leo|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces). When set alongside `caption`, a gold zodiac glyph + divider are stacked above the text. Ignored if not a recognised sign."),
     caption_fade: bool = Form(True, description="Video only: when true (default) the caption fades in ~1s after the start; set false to show it from the very first frame. No effect on images (their caption is always immediate)."),
     background_music: bool = Form(False, description="Video only: mux a looping royalty-free background-music bed (/workspace/assets/horoscope_bgm.m4a) under the clip, trimmed to length with a soft fade. No effect on images."),
-    face_filter: bool = Form(True, description="Reject the input image when it matches a blocked face identity. Enabled by default."),
+    face_filter: bool = Form(True, description="Deprecated compatibility flag. The server always rejects images matching the CMS blocked-face list."),
     require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the uploaded image unless at least one clear face is detectable. Default false."),
 ):
     if preset not in LTX_PRESETS:
@@ -1639,7 +1634,7 @@ async def ltx_motion_control(
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),
-    face_filter: bool = Form(True, description="Reject the character image when it matches a blocked face identity. Enabled by default."),
+    face_filter: bool = Form(True, description="Deprecated compatibility flag. The server always rejects images matching the CMS blocked-face list."),
     require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the character image unless at least one clear face is detectable. Default false."),
 ):
     """Kling-style motion control via LTX 2.3.
@@ -2219,7 +2214,7 @@ async def flux_face_swap(
     cfg: float = Form(1.0),
     guidance: float = Form(4.0),
     lora_strength: float = Form(1.0),
-    face_filter: bool = Form(True, description="Reject the request if either input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass face_filter=false to skip (and the proxies/edge functions always force True so this default only matters for direct pod callers)."),
+    face_filter: bool = Form(True, description="Deprecated compatibility flag. The server always rejects inputs and outputs matching the CMS blocked-face list."),
     logo_filter: bool = Form(True, description="Reject the request if either input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
@@ -2271,7 +2266,7 @@ async def flux_face_swap(
     # like a blocked identity (e.g. LoRA drift in face-swap mode).
     background_tasks.add_task(
         run_job, job_id, workflow, [target_path, face_path], watermark, watermark_image,
-        output_face_filter=face_filter, output_logo_filter=logo_filter,
+        output_face_filter=ENFORCE_FACE_BLOCKLIST, output_logo_filter=logo_filter,
         output_endpoint="/flux/face-swap", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
         refine_face=refine_face, refine_face_filename=face_filename,
         refine_megapixels=megapixels, refine_steps=steps, refine_cfg=cfg,
@@ -2419,7 +2414,7 @@ async def flux_image_to_image(
     composition_mode: str = Form("none", description="Pre-baked prompt + LoRA preset for prompt-less callers. `none` (default) = no template, behaves like before. `auto` | `scene_blend` | `outfit_swap` | `style_transfer` = use that mode's template. See API.md → Composition modes."),
     quality_preset: str = Form("none", description="`none` (default) = use `steps` directly. `fast` = 4 steps, `balanced` = 8 steps, `high` = 12 steps. Overrides `steps` when set."),
     scene_image_index: int = Form(-1, description="For `composition_mode=scene_blend` only: which input image is the scene/canvas. -1 (default) = last image, which matches the typical 'user uploads first, library scene last' UI flow. Ignored for other modes.", ge=-1, le=4),
-    face_filter: bool = Form(True, description="Reject if any input image matches a face in /workspace/blocklist/. ON by default — clients must explicitly pass false to skip. Proxies/edge functions always force True so this default only matters for direct pod callers."),
+    face_filter: bool = Form(True, description="Deprecated compatibility flag. The server always rejects inputs and outputs matching the CMS blocked-face list."),
     logo_filter: bool = Form(True, description="Reject if any input image matches a logo/flag in /workspace/blocklist_logos/. ON by default — same defense-in-depth rationale as face_filter."),
     watermark: str | None = Form(None, description="Optional text to overlay at the bottom-right of the output (e.g. 'AI'). Null/empty = no watermark."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo (loaded once from /workspace/assets/metfone_genai_watermark.png) at the bottom-right. Stacks with `watermark` if both are set."),
@@ -2510,7 +2505,7 @@ async def flux_image_to_image(
     # though the unedited input didn't match.
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
-        output_face_filter=face_filter, output_logo_filter=logo_filter,
+        output_face_filter=ENFORCE_FACE_BLOCKLIST, output_logo_filter=logo_filter,
         output_endpoint="/flux/i2i", caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music,
     )
     return {
@@ -3165,9 +3160,11 @@ async def admin_test_face_filter(
         per_face.append({
             "face_index": fi,
             "bbox": [float(x) for x in bbox],
-            "area_ratio": round(
-                (max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1]) / max(1, img_area)), 4
-            ),
+            "area_ratio": round(float(
+                max(0.0, bbox[2] - bbox[0])
+                * max(0.0, bbox[3] - bbox[1])
+                / max(1, img_area)
+            ), 4),
             "top_scores": [{"identity": i, "score": round(s, 4)} for i, s in scored[:top_n]],
         })
 
