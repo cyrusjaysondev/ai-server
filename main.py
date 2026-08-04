@@ -18,6 +18,7 @@ from workflows import (
     LTX_ASPECT_RATIOS,
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
+    MOTION_IDENTITY_MIN_STRENGTH,
     MOTION_CHUNK_FRAMES,
     MOTION_FPS,
     MOTION_MAX_DURATION_SECONDS,
@@ -65,7 +66,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.1"
+API_VERSION = "2.3.2"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1872,7 +1873,7 @@ async def ltx_motion_control(
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Accepted for API compatibility; currently ignored by the IC-LoRA motion workflow."),
-    inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Character-image identity anchor. 1.0 locks appearance most strongly; 0.5 balances identity and motion."),
+    inplace_strength: float = Form(MOTION_IDENTITY_MIN_STRENGTH, ge=0.0, le=1.0, description="Character-image identity anchor. Motion control enforces a 0.9 minimum so the uploaded person's identity, apparent gender, body, and clothing are not replaced by the reference performer."),
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="DWPose IC-LoRA guide strength. 1.0 follows the reference motion most closely."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),
@@ -1907,6 +1908,7 @@ async def ltx_motion_control(
 
     seed = seed if seed != -1 else uuid.uuid4().int % 2**32
     width, height = compute_ltx_dimensions(width, height, aspect_ratio)
+    inplace_strength = max(MOTION_IDENTITY_MIN_STRENGTH, inplace_strength)
 
     # Persist the character image into ComfyUI's input dir under a stable
     # name — same pattern as /ltx/i2v. The cleanup list at the end ensures
@@ -2113,6 +2115,11 @@ async def ltx_motion_control(
         "fps": MOTION_FPS,
         "segments": len(chunk_specs),
         "audio_source": "reference" if audio else "none",
+        "identity_lock": {
+            "enabled": True,
+            "inplace_strength": inplace_strength,
+            "reference_appearance_used": False,
+        },
         "note": (
             "Output duration follows the reference video up to 15 seconds. "
             "IC-LoRA guide padding is cropped before decode; no destructive "

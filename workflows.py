@@ -866,6 +866,42 @@ def build_ltx_t2v_workflow(prompt: str, negative_prompt: str,
 # (typically 97 frames) and downscale to the target resolution.
 # ─────────────────────────────────────────────
 
+MOTION_IDENTITY_MIN_STRENGTH = 0.9
+
+MOTION_IDENTITY_PROMPT = (
+    "IDENTITY LOCK: The character image is the only source for the subject's "
+    "identity and appearance. Keep the exact same person in every frame: the "
+    "same apparent gender presentation, age, face and facial features, "
+    "hairstyle, skin tone, body shape and proportions, and clothing. The "
+    "reference video supplies pose, timing, and motion only. Never copy the "
+    "reference performer's face, body, gender presentation, hair, facial hair, "
+    "or clothing."
+)
+
+MOTION_IDENTITY_NEGATIVE = (
+    "different person, identity drift, face change, gender change, body type "
+    "change, age change, hairstyle change, facial hair appearing or disappearing, "
+    "clothing change, reference performer appearance"
+)
+
+
+def protect_motion_identity_prompt(prompt: str, negative_prompt: str) -> tuple[str, str]:
+    """Add non-negotiable identity constraints to a motion-control prompt.
+
+    Motion references are control signals, never appearance references. Keeping
+    this policy in the workflow builder protects every caller, including older
+    clients that still submit weak or generic prompts.
+    """
+    action = prompt.strip() or "The subject performs the reference motion."
+    protected_prompt = f"{MOTION_IDENTITY_PROMPT} ACTION: {action}"
+    negative = negative_prompt.strip()
+    protected_negative = (
+        f"{negative}, {MOTION_IDENTITY_NEGATIVE}"
+        if negative
+        else MOTION_IDENTITY_NEGATIVE
+    )
+    return protected_prompt, protected_negative
+
 def _build_ltx_motion_workflow_no_vhs_legacy(reference_frame_filenames: list[str],
                                              character_image_filename: str,
                                              prompt: str, negative_prompt: str,
@@ -1151,7 +1187,15 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     # Clamp strengths into [0,1] — the IC-LoRA guide enforces this and
     # so does LTXVImgToVideoConditionOnly.
     motion_strength = max(0.0, min(1.0, motion_strength))
-    inplace_strength = max(0.0, min(1.0, inplace_strength))
+    # Motion control promises to animate the uploaded person, not invent a
+    # demographically similar replacement. Values below 0.9 caused confirmed
+    # production drift (a woman became a bearded man while clothing colour was
+    # retained), so identity anchoring has a safe floor for every caller.
+    inplace_strength = max(
+        MOTION_IDENTITY_MIN_STRENGTH,
+        min(1.0, inplace_strength),
+    )
+    prompt, negative_prompt = protect_motion_identity_prompt(prompt, negative_prompt)
     distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
     sigmas = _LTX_DISTILLED_LOW_SIGMAS
 

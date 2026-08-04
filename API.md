@@ -565,7 +565,9 @@ Copy the body motion from a reference video onto a separate character image.
 The endpoint extracts a DWPose skeleton from the video and uses LTX 2.3
 Union-Control IC-LoRA to render the character following that pose. The
 reference person's face, clothing, and background are not used as appearance
-inputs.
+inputs. Identity lock is always applied: the character image remains the sole
+source for the subject's face, apparent gender, age, body proportions, hair,
+skin tone, and clothing.
 
 ### Parameters
 
@@ -586,7 +588,7 @@ inputs.
 | `seed` | int | `-1` | Random when `-1`; set a value for repeatability |
 | `audio` | bool | `false` | Mux the reference video's original audio onto the result |
 | `enhance_prompt` | bool | `true` | Accepted for compatibility; ignored for motion control |
-| `inplace_strength` | float | `0.5` | Character identity-anchor strength (0–1) |
+| `inplace_strength` | float | `0.9` | Character identity-anchor strength (0–1). Values below `0.9` are raised to `0.9` to prevent identity and apparent-gender drift. |
 | `motion_strength` | float | `1.0` | DWPose motion-guide strength (0–1) |
 | `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
 | `require_detectable_face` | bool | `false` | Require a detectable face in the character image |
@@ -612,7 +614,7 @@ RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
   -F "match_reference_duration=true" \
   -F "max_duration_seconds=15" \
   -F "audio=true" \
-  -F "inplace_strength=0.5" \
+  -F "inplace_strength=0.9" \
   -F "motion_strength=1.0")
 
 echo "$RESPONSE" | python3 -m json.tool

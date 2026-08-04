@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from workflows import (
+    MOTION_IDENTITY_MIN_STRENGTH,
     build_ltx_motion_workflow,
     build_ltx_motion_workflow_no_vhs,
     duration_to_ltx_frames,
@@ -41,8 +42,18 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["331"]["inputs"]["latent"], ["215", 0])
         self.assertEqual(workflow["251"]["inputs"]["samples"], ["331", 2])
         self.assertEqual(workflow["269"]["inputs"]["image"], "character.png")
-        self.assertEqual(workflow["325"]["inputs"]["strength"], 0.5)
+        self.assertEqual(
+            workflow["325"]["inputs"]["strength"],
+            MOTION_IDENTITY_MIN_STRENGTH,
+        )
         self.assertEqual(workflow["330"]["inputs"]["strength"], 1.0)
+        self.assertIn("IDENTITY LOCK", workflow["240"]["inputs"]["text"])
+        self.assertIn(
+            "reference video supplies pose, timing, and motion only",
+            workflow["240"]["inputs"]["text"],
+        )
+        self.assertIn("gender change", workflow["247"]["inputs"]["text"])
+        self.assertIn("reference performer appearance", workflow["247"]["inputs"]["text"])
 
     def test_workflow_uses_safe_canvas_and_fixed_motion_timeline(self):
         workflow = build_ltx_motion_workflow(
