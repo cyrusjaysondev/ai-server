@@ -875,13 +875,16 @@ MOTION_IDENTITY_PROMPT = (
     "hairstyle, skin tone, body shape and proportions, and clothing. The "
     "reference video supplies pose, timing, and motion only. Never copy the "
     "reference performer's face, body, gender presentation, hair, facial hair, "
-    "or clothing."
+    "or clothing. Preserve natural, symmetrical eyes and stable facial features. "
+    "Render anatomically correct hands with five distinct fingers when visible."
 )
 
 MOTION_IDENTITY_NEGATIVE = (
     "different person, identity drift, face change, gender change, body type "
     "change, age change, hairstyle change, facial hair appearing or disappearing, "
-    "clothing change, reference performer appearance"
+    "clothing change, reference performer appearance, asymmetrical eyes, crossed "
+    "eyes, malformed eyes, malformed hands, mutated fingers, extra fingers, "
+    "missing fingers, fused fingers"
 )
 
 
@@ -1177,13 +1180,13 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     Notes vs. earlier callers:
       • `audio` is ignored (caller in main.py forces it False and muxes
         reference audio post-generation).
-      • `preset` is ignored for now — IC-LoRA path is single-pass with
-        the 8-step distilled sigmas. Two-pass refinement on top of
-        IC-LoRA is non-trivial and not part of Lightricks' example.
-      • `enhance_prompt` is ignored — Gemma rewriting the prompt based
-        on character image alone tends to fight pose conditioning.
+      • `quality` uses an 8-step half-resolution IC-LoRA pass, the official
+        LTX 2× latent upscaler, and a 3-step full-resolution refine pass.
+        This improves small faces, eyes, and hands without doubling the
+        expensive first-pass sampling cost.
+      • Image-aware Gemma prompting is always enabled for identity safety.
     """
-    _ = preset, audio, enhance_prompt, motion_strength, inplace_strength  # acknowledged-but-restricted
+    _ = audio, enhance_prompt
     # Clamp strengths into [0,1] — the IC-LoRA guide enforces this and
     # so does LTXVImgToVideoConditionOnly.
     motion_strength = max(0.0, min(1.0, motion_strength))
@@ -1197,20 +1200,43 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         min(1.0, inplace_strength),
     )
     prompt, negative_prompt = protect_motion_identity_prompt(prompt, negative_prompt)
+    quality_mode = preset == "quality"
     distilled_lora_strength = LTX_PRESETS["fast"]["lora_strength"]  # 0.5
     sigmas = _LTX_DISTILLED_LOW_SIGMAS
+    refine_sigmas = LTX_PRESETS["quality"]["high_res_sigmas"]
 
-    # ─── Snap canvas dims to a multiple of 64 ─────────────────────
+    # ─── Resolve stage and output canvases ────────────────────────
     # v32 reverted to the IC-LoRA Union-Control path which has
     # latent_downscale_factor=2.0 — meaning the latent spatial dims
     # must be divisible by 2, which means image dims must be divisible
     # by 32 (LTX latent stride) × 2 = 64. Without this we hit:
     # "Latent spatial size 17x30 must be divisible by
     # latent_downscale_factor 2.0" (17 = 544/32 is odd → fail).
-    # Snap UP so the canvas never shrinks; 544×960 → 576×960
-    # (still 9:16, latent 18×30 — both even).
-    width = ((width + 63) // 64) * 64
-    height = ((height + 63) // 64) * 64
+    # Fast mode snaps the requested canvas up. Quality mode samples on a
+    # smaller 64-aligned canvas and uses LTX's learned 2× latent upscaler,
+    # producing a sharper final canvas for roughly comparable compute.
+    requested_width = width
+    requested_height = height
+    if quality_mode:
+        stage_width = max(256, ((max(1, requested_width // 2) + 63) // 64) * 64)
+        stage_height = max(
+            256,
+            (
+                (
+                    round(stage_width * requested_height / max(1, requested_width))
+                    + 63
+                )
+                // 64
+            )
+            * 64,
+        )
+        width = stage_width * 2
+        height = stage_height * 2
+    else:
+        width = ((width + 63) // 64) * 64
+        height = ((height + 63) // 64) * 64
+        stage_width = width
+        stage_height = height
 
     # ─── Length + fps: match the Lightricks Union-Control example ─
     # Reverted v22's "halve EmptyLTXVLatentVideo length" — that was
@@ -1247,9 +1273,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     # height) — that way pose tracking has resolution while staying
     # cheap. The output then gets resized to a multiple of 64 (same
     # grid as the canvas) so its encoded latent is even-divisible.
-    dw_shorter = min(width, height)
-    if dw_shorter < 384:
-        dw_shorter = 384  # floor — below this DWPose loses confidence
+    dw_shorter = max(512, min(width, height))
 
     workflow: dict = {
         # ─── Checkpoint + LoRAs ────────────────────────────────────
@@ -1296,7 +1320,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # ─── Prompts ───────────────────────────────────────────────
         "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
             "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
-            "max_length": 256, "sampling_mode": "on",
+            "max_length": 192, "sampling_mode": "on",
             "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
             "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
             "sampling_mode.repetition_penalty": 1.05,
@@ -1317,7 +1341,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         "238": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["269", 0],
             "resize_type": "scale dimensions",
-            "resize_type.width": width, "resize_type.height": height,
+            "resize_type.width": stage_width, "resize_type.height": stage_height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
         # LTX's official I2V workflow preprocesses character pixels before VAE
@@ -1327,7 +1351,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "image": ["238", 0], "img_compression": 18,
         }},
         "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
-            "width": width, "height": height, "length": length, "batch_size": 1,
+            "width": stage_width, "height": stage_height,
+            "length": length, "batch_size": 1,
         }},
         # LTXVImgToVideoConditionOnly — applies the character image as
         # the identity anchor at frame 0. bypass=False means we USE the
@@ -1370,8 +1395,10 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "image": ["311", 0],
             "detect_hand": "enable",
             "detect_body": "enable",
-            "detect_face": "enable",
-            "resolution": 512,
+            # Body motion does not require reference facial landmarks. Those
+            # low-resolution keypoints were distorting the generated eyes.
+            "detect_face": "disable",
+            "resolution": 768,
             "bbox_detector": "yolox_l.onnx",
             "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
             "scale_stick_for_xinsr_cn": "disable",
@@ -1381,8 +1408,10 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # dims divisible by 32*2 = 64).
         "321": {"class_type": "ResizeImageMaskNode", "inputs": {
             "input": ["320", 0],
-            "resize_type": "scale to multiple",
-            "resize_type.multiple": 64,
+            "resize_type": "scale dimensions",
+            "resize_type.width": stage_width,
+            "resize_type.height": stage_height,
+            "resize_type.crop": "center",
             "scale_method": "lanczos",
         }},
 
@@ -1457,13 +1486,98 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "filename_prefix": "ltx_motion",
             "format": "video/h264-mp4",
             "pix_fmt": "yuv420p",
-            "crf": 19,
+            "crf": 17 if quality_mode else 19,
             "save_metadata": True,
             "trim_to_audio": False,
             "pingpong": False,
             "save_output": True,
         }},
     }
+
+    if quality_mode:
+        # Two-stage motion quality path. Stage 1 handles the expensive temporal
+        # generation on the smaller canvas. The learned LTX upscaler and a
+        # short full-resolution re-guided pass recover facial, eye, and hand
+        # detail while keeping the same identity and motion controls.
+        workflow.update({
+            "322": {"class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["320", 0],
+                "resize_type": "scale dimensions",
+                "resize_type.width": width,
+                "resize_type.height": height,
+                "resize_type.crop": "center",
+                "scale_method": "lanczos",
+            }},
+            "338": {"class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["269", 0],
+                "resize_type": "scale dimensions",
+                "resize_type.width": width,
+                "resize_type.height": height,
+                "resize_type.crop": "center",
+                "scale_method": "lanczos",
+            }},
+            "339": {"class_type": "LTXVPreprocess", "inputs": {
+                "image": ["338", 0], "img_compression": 18,
+            }},
+            "350": {"class_type": "LatentUpscaleModelLoader", "inputs": {
+                "model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
+            }},
+            "351": {"class_type": "LTXVLatentUpsampler", "inputs": {
+                "samples": ["331", 2],
+                "upscale_model": ["350", 0],
+                "vae": ["236", 2],
+            }},
+            "352": {"class_type": "LTXVImgToVideoConditionOnly", "inputs": {
+                "vae": ["236", 2],
+                "image": ["339", 0],
+                "latent": ["351", 0],
+                "strength": inplace_strength,
+                "bypass": False,
+            }},
+            "360": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
+                "positive": ["331", 0],
+                "negative": ["331", 1],
+                "vae": ["236", 2],
+                "latent": ["352", 0],
+                "image": ["322", 0],
+                "frame_idx": 0,
+                "strength": motion_strength,
+                "latent_downscale_factor": ["262", 1],
+                "crop": "disabled",
+                "use_tiled_encode": True,
+                "tile_size": 256,
+                "tile_overlap": 64,
+            }},
+            "361": {"class_type": "CFGGuider", "inputs": {
+                "model": ["262", 0],
+                "positive": ["360", 0],
+                "negative": ["360", 1],
+                "cfg": 1.0,
+            }},
+            "362": {"class_type": "KSamplerSelect", "inputs": {
+                "sampler_name": "euler_cfg_pp",
+            }},
+            "363": {"class_type": "RandomNoise", "inputs": {
+                "noise_seed": (seed + 1) % 2**32,
+            }},
+            "364": {"class_type": "ManualSigmas", "inputs": {
+                "sigmas": refine_sigmas,
+            }},
+            "365": {"class_type": "SamplerCustomAdvanced", "inputs": {
+                "noise": ["363", 0],
+                "guider": ["361", 0],
+                "sampler": ["362", 0],
+                "sigmas": ["364", 0],
+                "latent_image": ["360", 2],
+            }},
+            "366": {"class_type": "LTXVCropGuides", "inputs": {
+                "positive": ["360", 0],
+                "negative": ["360", 1],
+                "latent": ["365", 0],
+            }},
+        })
+        workflow["251"]["inputs"]["samples"] = ["366", 2]
+
     return workflow
 
 

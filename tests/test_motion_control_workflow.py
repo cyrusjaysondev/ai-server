@@ -37,6 +37,8 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["310"]["class_type"], "VHS_LoadVideo")
         self.assertEqual(workflow["310"]["inputs"]["video"], "dance.mp4")
         self.assertEqual(workflow["320"]["class_type"], "DWPreprocessor")
+        self.assertEqual(workflow["320"]["inputs"]["detect_face"], "disable")
+        self.assertEqual(workflow["320"]["inputs"]["resolution"], 768)
         self.assertEqual(workflow["330"]["class_type"], "LTXAddVideoICLoRAGuide")
         self.assertEqual(workflow["331"]["class_type"], "LTXVCropGuides")
         self.assertEqual(workflow["331"]["inputs"]["latent"], ["215", 0])
@@ -61,6 +63,35 @@ class MotionControlWorkflowTests(unittest.TestCase):
         )
         self.assertIn("gender change", workflow["247"]["inputs"]["text"])
         self.assertIn("reference performer appearance", workflow["247"]["inputs"]["text"])
+        self.assertIn("asymmetrical eyes", workflow["247"]["inputs"]["text"])
+        self.assertIn("extra fingers", workflow["247"]["inputs"]["text"])
+
+    def test_quality_motion_uses_two_stage_upscale_and_refine(self):
+        workflow = build_ltx_motion_workflow(
+            reference_video_filename="dance.mp4",
+            character_image_filename="character.png",
+            prompt="the character dances",
+            negative_prompt="deformed anatomy",
+            width=544,
+            height=960,
+            length=121,
+            fps=30,
+            seed=42,
+            preset="quality",
+        )
+
+        self.assertEqual(workflow["228"]["inputs"]["width"], 320)
+        self.assertEqual(workflow["228"]["inputs"]["height"], 576)
+        self.assertEqual(workflow["338"]["inputs"]["resize_type.width"], 640)
+        self.assertEqual(workflow["338"]["inputs"]["resize_type.height"], 1152)
+        self.assertEqual(workflow["350"]["class_type"], "LatentUpscaleModelLoader")
+        self.assertEqual(workflow["351"]["class_type"], "LTXVLatentUpsampler")
+        self.assertEqual(workflow["352"]["inputs"]["strength"], 1.0)
+        self.assertEqual(workflow["360"]["class_type"], "LTXAddVideoICLoRAGuide")
+        self.assertEqual(workflow["366"]["class_type"], "LTXVCropGuides")
+        self.assertEqual(workflow["251"]["inputs"]["samples"], ["366", 2])
+        self.assertEqual(workflow["242"]["inputs"]["crf"], 17)
+        self.assertEqual(workflow["274"]["inputs"]["max_length"], 192)
 
     def test_workflow_uses_safe_canvas_and_fixed_motion_timeline(self):
         workflow = build_ltx_motion_workflow(
@@ -114,6 +145,9 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertNotIn("trim_first_half", main_source)
         self.assertNotIn("_MOTION_CLEAN_FRACTION", main_source)
         self.assertIn("match_reference_duration", main_source)
+        self.assertIn("MOTION_SEGMENT_ESTIMATE_SECONDS", main_source)
+        self.assertIn("Segment {segment} of {total_segments}", main_source)
+        self.assertIn("overall_fraction", main_source)
 
     def test_setup_provisions_every_live_dependency(self):
         setup = (REPO_ROOT / "setup.sh").read_text()

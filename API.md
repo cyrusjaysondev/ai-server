@@ -577,7 +577,7 @@ skin tone, and clothing.
 | `image` | file | **required** | Character image to animate; a clear full-body image works best |
 | `prompt` | string | `""` | Action description; the server combines it with an image-aware description of the uploaded character |
 | `negative_prompt` | string | *server default* | Artifacts and traits to avoid |
-| `preset` | string | `fast` | Accepted for compatibility; the fixed 8-step IC-LoRA workflow is used |
+| `preset` | string | `quality` | `quality` uses a half-resolution 8-step pass, learned 2× upscale, and 3-step full-resolution refine for better eyes, faces, and hands. `fast` keeps the single-stage 8-step path. |
 | `aspect_ratio` | string | `9:16` | Output aspect ratio |
 | `width` | int | `544` | Requested width; dimensions snap to IC-LoRA-safe multiples of 64 |
 | `height` | int | `960` | Used with `aspect_ratio=original`; otherwise the ratio determines it |
@@ -598,7 +598,11 @@ long references in GPU-safe four-second segments, shares the boundary frame
 between adjacent segments, and joins them into one continuous result. After
 every sample, the server runs the required `LTXVCropGuides` node before VAE
 decode, so IC-LoRA padding is not exposed as noisy frames. No percentage-based
-post-generation trim is applied.
+post-generation trim is applied. Status polling reports overall segment-aware
+progress and a whole-job ETA; a full 15-second render on the current 22B GPU
+typically takes about 8–12 minutes, while shorter templates complete sooner.
+Quality mode also disables reference facial landmarks, raises DWPose hand/body
+tracking resolution, and re-applies the character identity at full resolution.
 
 ### Submit, poll, and download
 
@@ -613,6 +617,7 @@ RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
   -F "height=960" \
   -F "match_reference_duration=true" \
   -F "max_duration_seconds=15" \
+  -F "preset=quality" \
   -F "audio=true" \
   -F "inplace_strength=1.0" \
   -F "motion_strength=1.0")

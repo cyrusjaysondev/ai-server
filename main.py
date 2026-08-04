@@ -66,7 +66,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.3"
+API_VERSION = "2.3.4"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -146,6 +146,15 @@ AI_GEN_ROLE = os.environ.get("AI_GEN_ROLE", "general").strip().lower() or "gener
 VIDEO_PROGRESS_ESTIMATE_SECONDS = max(
     20,
     int(os.environ.get("VIDEO_PROGRESS_ESTIMATE_SECONDS", "55")),
+)
+# The 22B motion workflow renders a 15-second template as four GPU-safe
+# segments. Live production measurements are about 150-165 seconds per segment,
+# including image-aware prompt generation and VAE decode. Keep this separate
+# from ordinary I2V progress so motion jobs do not claim 90% / 0s after only the
+# first segment.
+MOTION_SEGMENT_ESTIMATE_SECONDS = max(
+    60,
+    int(os.environ.get("MOTION_SEGMENT_ESTIMATE_SECONDS", "165")),
 )
 
 
@@ -367,25 +376,56 @@ async def _wait_for_comfy_prompt(
 
             if job_id and jobs.get(job_id, {}).get("workload") == "video":
                 elapsed = max(0, int(loop.time() - started_monotonic))
-                if elapsed < 10:
+                job = jobs[job_id]
+                segment = max(1, int(job.get("segment") or 1))
+                total_segments = max(segment, int(job.get("segments") or 1))
+                is_motion_job = "segments" in job
+                estimate = (
+                    MOTION_SEGMENT_ESTIMATE_SECONDS
+                    if is_motion_job
+                    else VIDEO_PROGRESS_ESTIMATE_SECONDS
+                )
+                if elapsed < 12:
                     stage = "loading_models"
                     message = "Loading the video model..."
-                elif elapsed < max(35, VIDEO_PROGRESS_ESTIMATE_SECONDS - 12):
+                elif elapsed < max(35, int(estimate * 0.68)):
                     stage = "sampling"
                     message = "Rendering video frames..."
                 else:
                     stage = "decoding"
                     message = "Decoding the rendered frames..."
-                progress = min(
-                    90,
-                    15 + int((elapsed / VIDEO_PROGRESS_ESTIMATE_SECONDS) * 75),
-                )
+                if is_motion_job:
+                    # Map this ComfyUI prompt's progress into its slice of the
+                    # complete multi-segment job. Cap the active segment at 95%
+                    # so the UI never advertises completion before ComfyUI does.
+                    segment_fraction = min(0.95, elapsed / estimate)
+                    overall_fraction = (
+                        (segment - 1) + segment_fraction
+                    ) / total_segments
+                    progress = min(87, 10 + int(overall_fraction * 78))
+                    progress = max(int(job.get("progress") or 0), progress)
+                    message = f"{message} Segment {segment} of {total_segments}."
+                    if elapsed < estimate:
+                        current_remaining = estimate - elapsed
+                    else:
+                        # A busy decoder must never show zero seconds while it
+                        # is still running. Extend the estimate adaptively.
+                        current_remaining = max(15, int(elapsed * 0.2))
+                    remaining_segment_estimate = max(estimate, elapsed)
+                    eta_seconds = int(
+                        current_remaining
+                        + (total_segments - segment) * remaining_segment_estimate
+                        + 15  # final join + audio mux
+                    )
+                else:
+                    progress = min(90, 15 + int((elapsed / estimate) * 75))
+                    eta_seconds = max(0, estimate - elapsed)
                 jobs[job_id] = {
-                    **jobs[job_id],
+                    **job,
                     "progress": progress,
                     "stage": stage,
                     "progress_message": message,
-                    "eta_seconds": max(0, VIDEO_PROGRESS_ESTIMATE_SECONDS - elapsed),
+                    "eta_seconds": eta_seconds,
                 }
 
             response = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
@@ -1035,6 +1075,7 @@ async def run_motion_control_job(
     character_image_filename: str,
     prompt: str,
     negative_prompt: str,
+    preset: str,
     width: int,
     height: int,
     seed: int,
@@ -1085,7 +1126,7 @@ async def run_motion_control_job(
                 length=spec["length"],
                 fps=MOTION_FPS,
                 seed=(seed + index) % 2**32,
-                preset="fast",
+                preset=preset,
                 audio=False,
                 enhance_prompt=False,
                 inplace_strength=inplace_strength,
@@ -1160,6 +1201,7 @@ async def run_motion_control_job(
         thumbnail = await asyncio.to_thread(_extract_video_thumbnail, final_path)
         completed_at = datetime.now(timezone.utc)
         completed = {
+            **jobs.get(job_id, {}),
             "status": "completed",
             "url": f"{BASE_URL}/video/{final_path.name}",
             "filename": final_path.name,
@@ -1862,9 +1904,9 @@ async def ltx_motion_control(
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
     prompt: str = Form("", description="Free-form action description. The server combines it with an image-aware description of the uploaded character so visible identity traits persist through motion."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
-    preset: str = Form("fast", description="Accepted for API compatibility. Motion control currently uses the fixed 8-step distilled IC-LoRA workflow."),
+    preset: str = Form("quality", description="Motion quality preset: quality (default, two-stage learned upscale + refine for better faces, eyes, and hands) or fast (single-stage 8-step render)."),
     aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
-    width: int = Form(544, description="Output width — height is derived from aspect_ratio. For 9:16 dance refs the 544×960 fast / 720×1280 quality presets are tuned for clean motion."),
+    width: int = Form(544, description="Requested output width; height follows aspect_ratio. Quality mode renders a smaller first pass and delivers a learned 2× upscale (about 640×1152 for the default 9:16 request)."),
     height: int = Form(960, description="Only used when aspect_ratio=original."),
     length: int = Form(121, description="Fallback frame count when match_reference_duration=false. It is snapped to LTX's required 8n+1 format."),
     fps: int = Form(24, description="Accepted for API compatibility. Motion control renders at 30 fps."),
@@ -1901,8 +1943,8 @@ async def ltx_motion_control(
          NOT used here — Kling-style carry-over of the source audio is
          what users expect from a motion-control endpoint.
     """
-    if preset not in LTX_PRESETS:
-        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
+    if preset not in {"fast", "quality"}:
+        raise HTTPException(400, "Motion preset must be 'fast' or 'quality'")
     if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
         raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
 
@@ -2091,6 +2133,7 @@ async def ltx_motion_control(
         img_filename,
         prompt,
         negative_prompt,
+        preset,
         width,
         height,
         seed,
@@ -2114,6 +2157,7 @@ async def ltx_motion_control(
         "target_frames": target_frame_count,
         "fps": MOTION_FPS,
         "segments": len(chunk_specs),
+        "preset": preset,
         "audio_source": "reference" if audio else "none",
         "identity_lock": {
             "enabled": True,
