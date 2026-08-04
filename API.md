@@ -579,8 +579,10 @@ inputs.
 | `aspect_ratio` | string | `9:16` | Output aspect ratio |
 | `width` | int | `544` | Requested width; dimensions snap to IC-LoRA-safe multiples of 64 |
 | `height` | int | `960` | Used with `aspect_ratio=original`; otherwise the ratio determines it |
-| `length` | int | `121` | Motion frame budget; larger values increase duration and generation time |
+| `length` | int | `121` | Fallback frame budget used only when `match_reference_duration=false` |
 | `fps` | int | `24` | Accepted for compatibility; motion processing and output use 30 fps |
+| `match_reference_duration` | bool | `true` | Match the output to the reference duration instead of forcing a five-second result |
+| `max_duration_seconds` | float | `15` | Maximum reference duration to render (1–15 seconds) |
 | `seed` | int | `-1` | Random when `-1`; set a value for repeatability |
 | `audio` | bool | `false` | Mux the reference video's original audio onto the result |
 | `enhance_prompt` | bool | `true` | Accepted for compatibility; ignored for motion control |
@@ -589,9 +591,12 @@ inputs.
 | `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
 | `require_detectable_face` | bool | `false` | Require a detectable face in the character image |
 
-The IC-LoRA guide becomes unstable near the decoded tail. The server keeps
-only the first 40% clean conditioning window and removes the colored-noise
-tail before returning the video.
+The endpoint follows the reference duration up to 15 seconds. It generates
+long references in GPU-safe four-second segments, shares the boundary frame
+between adjacent segments, and joins them into one continuous result. After
+every sample, the server runs the required `LTXVCropGuides` node before VAE
+decode, so IC-LoRA padding is not exposed as noisy frames. No percentage-based
+post-generation trim is applied.
 
 ### Submit, poll, and download
 
@@ -604,7 +609,8 @@ RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
   -F "aspect_ratio=9:16" \
   -F "width=544" \
   -F "height=960" \
-  -F "length=121" \
+  -F "match_reference_duration=true" \
+  -F "max_duration_seconds=15" \
   -F "audio=true" \
   -F "inplace_strength=0.5" \
   -F "motion_strength=1.0")

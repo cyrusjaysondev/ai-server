@@ -18,6 +18,9 @@ from workflows import (
     LTX_ASPECT_RATIOS,
     LTX_DEFAULT_NEGATIVE,
     LTX_PRESETS,
+    MOTION_CHUNK_FRAMES,
+    MOTION_FPS,
+    MOTION_MAX_DURATION_SECONDS,
     MULTI_FACE_SWAP_ORDERS,
     build_flux_i2i_workflow,
     build_flux_multi_face_swap_workflow,
@@ -30,10 +33,13 @@ from workflows import (
     compute_dimensions,
     compute_ltx_dimensions,
     crop_to_aspect,
+    duration_to_ltx_frames,
     get_flux_face_swap_workflow,
     ltx_base_nodes,
     normalize_target_face_indices,
     preserve_selected_faces,
+    snap_ltx_frame_count,
+    split_ltx_frame_count,
 )
 
 # Compliance face filter (loaded lazily on first face_filter=true request).
@@ -59,7 +65,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.0"
+API_VERSION = "2.3.1"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -333,72 +339,6 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
-_MOTION_CLEAN_FRACTION = 0.40  # empirically clean IC-LoRA conditioning window
-
-
-def _trim_first_half(video_path: Path) -> tuple[bool, str]:
-    """Keep only the first ~40% of a video's frames. Used by /ltx/motion
-    because the IC-LoRA Union-Control guide only conditions the first
-    portion of the output latent — the rest free-generates to colored
-    noise. Trimming gives users a fully-coherent clip at the cost of
-    duration.
-
-    Why 0.40 not 0.50: empirically the noise boundary in v33's output
-    fell at ~80% of the 50%-trimmed clip = ~40% of the raw decoded
-    output. Trim at 0.40 gives a small safety margin so the very last
-    frames are still clean. For length=257 the user gets ~7s clean;
-    for length=121 they get ~4s clean. To get a longer final clip,
-    request a proportionally longer `length` (multiply target seconds
-    by ~6).
-
-    Returns (changed, message).
-    """
-    import subprocess
-    if not video_path.exists():
-        return False, "input missing"
-
-    # Probe duration
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=nokey=1:noprint_wrappers=1", str(video_path)],
-            capture_output=True, timeout=15,
-        )
-        duration = float((probe.stdout or b"").decode().strip())
-    except Exception as e:
-        return False, f"ffprobe error: {e}"
-    if duration <= 0.1:
-        return False, "duration too short to trim"
-
-    clean_end = duration * _MOTION_CLEAN_FRACTION
-    tmp_out = video_path.with_name(f"{video_path.stem}.halftrim{video_path.suffix}")
-    # Re-encode video because stream copy at arbitrary cut points
-    # would leave us at the previous keyframe — re-encoding (libx264
-    # veryfast) gives a clean cut at the target mark. Audio is stream-
-    # copied because the audio mux ran first and we want to preserve
-    # the segment that aligns with the kept video.
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-i", str(video_path),
-        "-t", f"{clean_end:.3f}",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        "-c:a", "copy",
-        str(tmp_out),
-    ]
-    try:
-        res = subprocess.run(cmd, capture_output=True, timeout=120)
-    except Exception as e:
-        tmp_out.unlink(missing_ok=True)
-        return False, f"trim ffmpeg error: {e}"
-    if res.returncode != 0 or not tmp_out.exists() or tmp_out.stat().st_size == 0:
-        tmp_out.unlink(missing_ok=True)
-        err = (res.stderr or b"").decode(errors="replace")[-300:]
-        return False, f"trim failed: {err}"
-    os.replace(str(tmp_out), str(video_path))
-    return True, (f"trimmed to first {clean_end:.2f}s of {duration:.2f}s "
-                  f"({_MOTION_CLEAN_FRACTION*100:.0f}% — IC-LoRA clean region)")
-
-
 class JobCancelled(Exception):
     """Internal signal used when a user cancels an active API job."""
 
@@ -645,7 +585,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                   watermark_text: str | None = None,
                   watermark_image: bool = False,
                   audio_source_path: str | None = None,
-                  trim_first_half: bool = False,
                   *,
                   output_face_filter: bool = False,
                   output_logo_filter: bool = False,
@@ -890,25 +829,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                                 audio_mux_warning = str(mux_err)
                                 print(f"[{job_id}] audio mux raised: {mux_err}")
 
-                        # Optional first-half trim — used by /ltx/motion
-                        # because the IC-LoRA guide only conditions ~50% of
-                        # the output latent (the remaining frames collapse
-                        # to colored noise). Trim AFTER audio mux so the
-                        # surviving audio is the segment that lines up with
-                        # the kept video.
-                        trim_warning: str | None = None
-                        if trim_first_half and ext in _VIDEO_EXTS:
-                            try:
-                                ok, msg = await asyncio.to_thread(
-                                    _trim_first_half, path,
-                                )
-                                print(f"[{job_id}] trim: {msg}")
-                                if not ok:
-                                    trim_warning = msg
-                            except Exception as trim_err:
-                                trim_warning = str(trim_err)
-                                print(f"[{job_id}] trim raised: {trim_err}")
-
                         # Optional watermark — text and/or logo. Both run in
                         # place. Failures don't nuke the job; the
                         # unwatermarked file is still valid output.
@@ -1017,10 +937,6 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                             completed["watermark_warning"] = " | ".join(wm_warnings)
                         if audio_mux_warning:
                             completed["audio_warning"] = audio_mux_warning
-                        if trim_warning:
-                            completed["trim_warning"] = trim_warning
-                        elif trim_first_half:
-                            completed["trimmed"] = "clean_motion_region_40_percent"
                         if jobs.get(job_id, {}).get("status") != "cancelled":
                             jobs[job_id] = completed
                         return
@@ -1034,6 +950,258 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
         if cleanup_paths:
             for p in cleanup_paths:
                 Path(p).unlink(missing_ok=True)
+
+
+def _probe_video_duration_seconds(video_path: Path) -> float:
+    """Return the media duration reported by ffprobe, or raise ValueError."""
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            str(video_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if probe.returncode != 0:
+        raise ValueError((probe.stderr or "ffprobe failed").strip())
+    try:
+        duration = float(probe.stdout.strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("reference video has no readable duration") from exc
+    if duration <= 0:
+        raise ValueError("reference video duration must be greater than zero")
+    return duration
+
+
+def _concat_motion_chunks(chunk_paths: list[Path], output_path: Path) -> None:
+    """Join clean motion chunks while removing duplicated boundary frames."""
+    if len(chunk_paths) < 2:
+        raise ValueError("at least two chunks are required for concatenation")
+
+    command = ["ffmpeg", "-y", "-loglevel", "error"]
+    for chunk_path in chunk_paths:
+        command.extend(["-i", str(chunk_path)])
+
+    filters: list[str] = []
+    labels: list[str] = []
+    for index in range(len(chunk_paths)):
+        label = f"v{index}"
+        trim = "" if index == 0 else "trim=start_frame=1,"
+        filters.append(f"[{index}:v]{trim}setpts=PTS-STARTPTS[{label}]")
+        labels.append(f"[{label}]")
+    filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[outv]")
+
+    command.extend([
+        "-filter_complex", ";".join(filters),
+        "-map", "[outv]",
+        "-an",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "19",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0 or not output_path.exists() or output_path.stat().st_size == 0:
+        output_path.unlink(missing_ok=True)
+        raise RuntimeError(f"could not join motion segments: {(result.stderr or 'ffmpeg failed')[-500:]}")
+
+
+def _extract_motion_continuity_frame(video_path: Path, image_path: Path) -> bool:
+    """Extract the last decoded frame of a chunk for the next chunk's anchor."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-sseof", "-1", "-i", str(video_path),
+            "-vf", "reverse",
+            "-frames:v", "1",
+            str(image_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return result.returncode == 0 and image_path.exists() and image_path.stat().st_size > 0
+
+
+async def run_motion_control_job(
+    job_id: str,
+    chunk_specs: list[dict],
+    character_image_filename: str,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    seed: int,
+    inplace_strength: float,
+    motion_strength: float,
+    cleanup_paths: list[str],
+    *,
+    audio_source_path: str | None,
+    watermark_text: str | None,
+    watermark_image: bool,
+    reference_duration_seconds: float,
+    target_frame_count: int,
+) -> None:
+    """Generate GPU-safe motion chunks, preserve continuity, and join them."""
+    chunk_outputs: list[Path] = []
+    continuity_inputs: list[Path] = []
+    final_path: Path | None = None
+    started_at = datetime.now(timezone.utc)
+    jobs[job_id] = {
+        **jobs.get(job_id, {}),
+        "status": "processing",
+        "started_at": started_at.isoformat(),
+        "stage": "generating_motion",
+        "progress": 10,
+        "progress_message": f"Generating motion segment 1 of {len(chunk_specs)}...",
+    }
+
+    try:
+        current_character_filename = character_image_filename
+        for index, spec in enumerate(chunk_specs):
+            if jobs.get(job_id, {}).get("status") == "cancelled":
+                raise JobCancelled(job_id)
+
+            jobs[job_id] = {
+                **jobs[job_id],
+                "stage": "generating_motion",
+                "segment": index + 1,
+                "segments": len(chunk_specs),
+                "progress": min(85, 10 + int(index / len(chunk_specs) * 75)),
+                "progress_message": f"Generating motion segment {index + 1} of {len(chunk_specs)}...",
+            }
+            workflow_args = dict(
+                character_image_filename=current_character_filename,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                length=spec["length"],
+                fps=MOTION_FPS,
+                seed=(seed + index) % 2**32,
+                preset="fast",
+                audio=False,
+                enhance_prompt=False,
+                inplace_strength=inplace_strength,
+                motion_strength=motion_strength,
+            )
+            if spec.get("frame_filenames"):
+                workflow = build_ltx_motion_workflow_no_vhs(
+                    reference_frame_filenames=spec["frame_filenames"],
+                    **workflow_args,
+                )
+            else:
+                workflow = build_ltx_motion_workflow(
+                    reference_video_filename=spec["video_filename"],
+                    **workflow_args,
+                )
+
+            _, output_path_str = await _submit_and_wait_comfyui(workflow, job_id)
+            output_path = Path(output_path_str)
+            chunk_outputs.append(output_path)
+
+            if index + 1 < len(chunk_specs):
+                continuity_filename = f"ltx_motion_continuity_{uuid.uuid4().hex}.png"
+                continuity_path = INPUT_DIR / continuity_filename
+                extracted = await asyncio.to_thread(
+                    _extract_motion_continuity_frame, output_path, continuity_path,
+                )
+                if extracted:
+                    continuity_inputs.append(continuity_path)
+                    current_character_filename = continuity_filename
+                else:
+                    continuity_path.unlink(missing_ok=True)
+                    # Fail open to the original identity image. The generated
+                    # chunks are still usable and the join remains frame-exact.
+                    current_character_filename = character_image_filename
+
+        jobs[job_id] = {
+            **jobs[job_id],
+            "stage": "joining_segments",
+            "progress": 90,
+            "progress_message": "Joining motion segments...",
+        }
+        if len(chunk_outputs) == 1:
+            final_path = chunk_outputs[0]
+        else:
+            final_path = OUTPUT_DIR / f"ltx_motion_full_{uuid.uuid4().hex}.mp4"
+            await asyncio.to_thread(_concat_motion_chunks, chunk_outputs, final_path)
+
+        audio_warning = None
+        if audio_source_path:
+            ok, message = await asyncio.to_thread(
+                _mux_reference_audio, final_path, Path(audio_source_path),
+            )
+            if not ok:
+                audio_warning = message
+
+        watermark_warnings: list[str] = []
+        if watermark_text and watermark is not None:
+            try:
+                watermark.apply(final_path, watermark_text)
+            except Exception as exc:
+                watermark_warnings.append(f"text: {exc}")
+        if watermark_image and watermark is not None:
+            try:
+                watermark.apply_logo(final_path)
+            except Exception as exc:
+                watermark_warnings.append(f"image: {exc}")
+
+        if jobs.get(job_id, {}).get("status") == "cancelled":
+            raise JobCancelled(job_id)
+
+        media_duration = await asyncio.to_thread(_probe_video_duration_seconds, final_path)
+        thumbnail = await asyncio.to_thread(_extract_video_thumbnail, final_path)
+        completed_at = datetime.now(timezone.utc)
+        completed = {
+            "status": "completed",
+            "url": f"{BASE_URL}/video/{final_path.name}",
+            "filename": final_path.name,
+            "completed_at": completed_at.isoformat(),
+            "duration_seconds": round((completed_at - started_at).total_seconds(), 1),
+            "media_duration_seconds": round(media_duration, 3),
+            "reference_duration_seconds": round(reference_duration_seconds, 3),
+            "frames": target_frame_count,
+            "fps": MOTION_FPS,
+            "segments": len(chunk_specs),
+            "progress": 100,
+            "stage": "completed",
+            "progress_message": "Video ready",
+            "eta_seconds": 0,
+        }
+        if thumbnail is not None:
+            completed["thumbnail_url"] = f"{BASE_URL}/image/{thumbnail.name}"
+        if audio_warning:
+            completed["audio_warning"] = audio_warning
+        if watermark_warnings:
+            completed["watermark_warning"] = " | ".join(watermark_warnings)
+        jobs[job_id] = completed
+    except JobCancelled:
+        jobs[job_id] = {**jobs.get(job_id, {}), "status": "cancelled"}
+        if final_path is not None:
+            final_path.unlink(missing_ok=True)
+    except Exception as exc:
+        jobs[job_id] = {
+            **jobs.get(job_id, {}),
+            "status": "failed",
+            "error": str(exc),
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if final_path is not None:
+            final_path.unlink(missing_ok=True)
+    finally:
+        for path in cleanup_paths:
+            Path(path).unlink(missing_ok=True)
+        for path in continuity_inputs:
+            path.unlink(missing_ok=True)
+        for path in chunk_outputs:
+            if final_path is None or path != final_path:
+                path.unlink(missing_ok=True)
 
 
 # ─────────────────────────────────────────────
@@ -1684,19 +1852,16 @@ async def ltx_text_to_video(
 # LTX Union-Control IC-LoRA applies that motion to the character image
 # without copying the reference person's face or clothes.
 #
-# Reference video constraints:
-#   - Caller can upload any length / resolution; we trim to `length`
-#     frames and downscale to the target canvas server-side via ffmpeg
-#     before handing to ComfyUI. Anything longer than `length / fps`
-#     seconds gets the leading clip; tail is dropped.
-#   - For Kling-style 30s dance refs, capture the first ~5s — that's
-#     usually one motion cycle which is what LTX can model in one shot.
+# Reference videos are matched automatically up to 15 seconds. Longer
+# timelines are generated as GPU-safe four-second passes and joined with
+# shared boundary frames so the final duration follows the source instead
+# of silently falling back to a five-second sample.
 # ─────────────────────────────────────────────
 
 @app.post("/ltx/motion")
 async def ltx_motion_control(
     background_tasks: BackgroundTasks,
-    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. Any length/resolution accepted — server trims and downscales to fit LTX's frame budget."),
+    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. The output matches its duration up to 15 seconds by default."),
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
     prompt: str = Form("", description="Free-form description of the character and action. The motion workflow uses it directly; enhance_prompt is accepted for API compatibility but ignored."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
@@ -1704,8 +1869,10 @@ async def ltx_motion_control(
     aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     width: int = Form(544, description="Output width — height is derived from aspect_ratio. For 9:16 dance refs the 544×960 fast / 720×1280 quality presets are tuned for clean motion."),
     height: int = Form(960, description="Only used when aspect_ratio=original."),
-    length: int = Form(121, description="Number of output frames (also caps reference-video frames pulled in). 97≈4s, 121≈5s, 161≈6.7s @24fps."),
-    fps: int = Form(24, description="Accepted for API compatibility. The IC-LoRA motion timeline runs at 30 fps."),
+    length: int = Form(121, description="Fallback frame count when match_reference_duration=false. It is snapped to LTX's required 8n+1 format."),
+    fps: int = Form(24, description="Accepted for API compatibility. Motion control renders at 30 fps."),
+    match_reference_duration: bool = Form(True, description="Match the output to the uploaded motion video's duration. Enabled by default so template videos are not cut to five seconds."),
+    max_duration_seconds: float = Form(MOTION_MAX_DURATION_SECONDS, ge=1.0, le=MOTION_MAX_DURATION_SECONDS, description="Maximum source duration to render. The production limit is 15 seconds."),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Accepted for API compatibility; currently ignored by the IC-LoRA motion workflow."),
@@ -1720,15 +1887,17 @@ async def ltx_motion_control(
 
     Pipeline:
       1. Save uploaded reference video + character image to ComfyUI input dir.
-      2. ffmpeg normalize the reference to the fixed 30 fps IC-LoRA timeline,
-         trim to `length` frames, downscale it, and strip audio.
+      2. Read the source duration and normalize it to a fixed 30 fps IC-LoRA
+         timeline (up to 15 seconds by default).
       3. VHS_LoadVideo + DWPose turn the reference into pose-only frames.
          Union-Control IC-LoRA combines that pose guide with the separate
          character-image identity anchor, then LTX renders the new subject.
-      4. Enqueue as a background job; client polls /status/<job_id>.
-      5. Keep the first 40% clean conditioning window so the unstable
-         colored-noise tail is never delivered.
-      6. (If audio=True) After ComfyUI returns the silent output video,
+      4. Crop IC-LoRA guide tokens after every sample, as required by the
+         official graph, so padded guide latents never decode as noisy frames.
+      5. Generate long references in four-second chunks, carry the previous
+         clean last frame into the next pass, and join shared boundaries.
+      6. Enqueue as a background job; client polls /status/<job_id>.
+      7. (If audio=True) After ComfyUI returns the silent output video,
          ffmpeg-mux the ORIGINAL reference's audio onto it — looping the
          audio with -stream_loop -1 if the source is shorter than the
          output, trimming with -shortest. The LTX audio-synthesis path is
@@ -1771,195 +1940,188 @@ async def ltx_motion_control(
         raise HTTPException(
             413,
             f"reference video too large: {len(raw_video_bytes) // (1024*1024)} MB > 100 MB. "
-            f"Trim to ~5s and downscale to <1080p before upload.",
+            f"Trim to 15s or less and downscale to <1080p before upload.",
         )
     raw_video_ext = (reference_video.filename or "").lower().rsplit(".", 1)[-1] or "mp4"
     raw_video_path = str(INPUT_DIR / f"ltx_motion_ref_raw_{uuid.uuid4().hex}.{raw_video_ext}")
     Path(raw_video_path).write_bytes(raw_video_bytes)
 
-    ref_video_filename = f"ltx_motion_ref_{uuid.uuid4().hex}.mp4"
-    ref_video_path = str(INPUT_DIR / ref_video_filename)
-
-    # ffmpeg pre-step: normalize the reference to exactly `length` frames
-    # at `fps` at the LTX canvas.
-    #
-    # `-stream_loop -1` BEFORE `-i` loops the input infinitely; combined
-    # with `-frames:v length` the output is guaranteed to have exactly
-    # `length` frames even if the source is shorter than `length / fps`
-    # seconds. Without this, a 2s clip with length=121 would give 48
-    # frames and the VAE-encoded motion latent would have the wrong
-    # temporal dimension for the LTX sampler.
-    #
-    # `-an` strips audio since we only use the visual track for motion —
-    # LTX's audio path is separate (`audio=True` synthesizes a fresh
-    # track to match the visual output).
-    #
-    # NOTE: the synchronous subprocess.run call is offloaded to a thread
-    # pool below so it doesn't block the FastAPI event loop while ffmpeg
-    # is encoding (can take 10-60s on a long source).
-    import asyncio
-    import subprocess
-    # Pose-video frame target: same as `length`. The IC-LoRA guide
-    # validates pose_latent_slices <= output_latent_slices, so we
-    # match exactly (v20's 2*length+7 hit the validation error).
-    ref_frame_count = length
-    # IC-LoRA Union-Control was trained on 30fps timelines (matches
-    # Lightricks' official example which sets CreateVideo fps=30).
-    # The user's `fps` param is accepted but the motion workflow
-    # forces 30 internally — keeping the user's fps would mismatch
-    # the pose timeline against the model's expected slots and cause
-    # the mid-clip noise we saw across v19-v24. The output mp4 is
-    # therefore at 30fps regardless of the requested fps.
-    motion_fps = 30
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-stream_loop", "-1", "-i", raw_video_path,
-        "-vf", (
-            f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
-            f"fps={motion_fps}"
-        ),
-        "-frames:v", str(ref_frame_count),
-        "-an",
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-        ref_video_path,
-    ]
-
-    def _run_ffmpeg() -> subprocess.CompletedProcess:
-        return subprocess.run(ffmpeg_cmd, check=True, capture_output=True, timeout=120)
-
+    raw_video_file = Path(raw_video_path)
     try:
-        await asyncio.to_thread(_run_ffmpeg)
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr or b"").decode(errors="replace")[:500]
-        Path(raw_video_path).unlink(missing_ok=True)
+        reference_duration = await asyncio.to_thread(
+            _probe_video_duration_seconds, raw_video_file,
+        )
+    except (ValueError, subprocess.SubprocessError) as exc:
+        raw_video_file.unlink(missing_ok=True)
         Path(img_path).unlink(missing_ok=True)
-        raise HTTPException(400, f"could not decode reference video: {stderr or 'ffmpeg failed'}")
-    except subprocess.TimeoutExpired:
-        Path(raw_video_path).unlink(missing_ok=True)
-        Path(img_path).unlink(missing_ok=True)
-        raise HTTPException(408, "reference video normalization timed out (>120s) — try a shorter / lower-res upload")
+        raise HTTPException(400, f"could not read reference video duration: {exc}")
 
-    # The raw upload is the source-of-truth for audio. If audio=True we
-    # need to hold onto it past the workflow run so run_job's audio mux
-    # step can pull its audio track. cleanup_paths gets it appended below
-    # so it's deleted after the job completes either way.
-    if not audio:
-        Path(raw_video_path).unlink(missing_ok=True)
+    if match_reference_duration:
+        target_frame_count = duration_to_ltx_frames(
+            reference_duration,
+            fps=MOTION_FPS,
+            max_duration_seconds=max_duration_seconds,
+        )
+    else:
+        max_frames = duration_to_ltx_frames(
+            max_duration_seconds,
+            fps=MOTION_FPS,
+            max_duration_seconds=max_duration_seconds,
+        )
+        target_frame_count = min(snap_ltx_frame_count(length), max_frames)
+    chunk_lengths = split_ltx_frame_count(
+        target_frame_count,
+        max_chunk_frames=MOTION_CHUNK_FRAMES,
+    )
 
-    # Workflow selection — VHS path is faster (1 node loads N frames in
-    # one shot) but requires ComfyUI-VideoHelperSuite. Fallback path
-    # extracts frames with ffmpeg and uses N LoadImage + chained
-    # ImageBatch nodes — stock ComfyUI only.
-    #
-    # We probe ComfyUI's /object_info to see which path is available.
-    # Probe is cheap (~50ms) and cached upstream by ComfyUI so it
-    # doesn't add real latency. If anything goes wrong probing, we
-    # default to the no-VHS fallback — it always works.
+    # VideoHelperSuite is the fast loader. If it is unavailable, normalized
+    # chunks are expanded into stock LoadImage/ImageBatch nodes; that fallback
+    # now uses the exact same DWPose + IC-LoRA + crop graph.
     use_vhs = False
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            obj_info_resp = await client.get(f"{COMFYUI_URL}/object_info")
-            if obj_info_resp.status_code == 200:
-                use_vhs = "VHS_LoadVideo" in obj_info_resp.json()
-    except Exception as e:
-        print(f"[ltx/motion] object_info probe failed: {e} — using no-VHS path")
+            object_info = await client.get(f"{COMFYUI_URL}/object_info")
+            use_vhs = (
+                object_info.status_code == 200
+                and "VHS_LoadVideo" in object_info.json()
+            )
+    except Exception as exc:
+        print(f"[ltx/motion] object_info probe failed: {exc} — using frame extraction")
 
     cleanup_paths: list[str] = [img_path]
-    # When audio=True we held onto raw_video_path above so run_job can
-    # mux its audio onto the output. Add it to cleanup so it's removed
-    # after the job (success OR failure) is done.
+    chunk_specs: list[dict] = []
+    created_paths: list[Path] = []
+    elapsed_intervals = 0
+
+    try:
+        for index, chunk_length in enumerate(chunk_lengths):
+            chunk_filename = f"ltx_motion_ref_{uuid.uuid4().hex}.mp4"
+            chunk_path = INPUT_DIR / chunk_filename
+            start_seconds = elapsed_intervals / MOTION_FPS
+            normalize_command = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-stream_loop", "-1",
+                "-ss", f"{start_seconds:.6f}",
+                "-i", raw_video_path,
+                "-vf", (
+                    f"scale=w={width}:h={height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    f"fps={MOTION_FPS}"
+                ),
+                "-frames:v", str(chunk_length),
+                "-an",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-preset", "veryfast",
+                str(chunk_path),
+            ]
+            normalized = await asyncio.to_thread(
+                subprocess.run,
+                normalize_command,
+                capture_output=True,
+                timeout=120,
+            )
+            if normalized.returncode != 0 or not chunk_path.exists():
+                stderr = (normalized.stderr or b"").decode(errors="replace")[-500:]
+                raise ValueError(stderr or "ffmpeg produced no normalized motion segment")
+            created_paths.append(chunk_path)
+
+            spec = {"length": chunk_length}
+            if use_vhs:
+                spec["video_filename"] = chunk_filename
+                cleanup_paths.append(str(chunk_path))
+            else:
+                frame_id = uuid.uuid4().hex[:8]
+                frame_pattern = INPUT_DIR / f"ltx_motion_frame_{frame_id}_%04d.png"
+                extracted = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "ffmpeg", "-y", "-loglevel", "error",
+                        "-i", str(chunk_path),
+                        "-vsync", "0",
+                        str(frame_pattern),
+                    ],
+                    capture_output=True,
+                    timeout=120,
+                )
+                if extracted.returncode != 0:
+                    stderr = (extracted.stderr or b"").decode(errors="replace")[-500:]
+                    raise ValueError(stderr or "could not extract normalized motion frames")
+                frame_files = sorted(
+                    INPUT_DIR.glob(f"ltx_motion_frame_{frame_id}_*.png")
+                )
+                if len(frame_files) != chunk_length:
+                    raise ValueError(
+                        f"motion segment {index + 1} produced {len(frame_files)} "
+                        f"frames; expected {chunk_length}"
+                    )
+                spec["frame_filenames"] = [path.name for path in frame_files]
+                cleanup_paths.extend(str(path) for path in frame_files)
+                created_paths.extend(frame_files)
+                chunk_path.unlink(missing_ok=True)
+
+            chunk_specs.append(spec)
+            elapsed_intervals += chunk_length - 1
+    except subprocess.TimeoutExpired:
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        raw_video_file.unlink(missing_ok=True)
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(
+            408,
+            "reference video normalization timed out — try a lower-resolution upload",
+        )
+    except (ValueError, OSError) as exc:
+        for path in created_paths:
+            path.unlink(missing_ok=True)
+        raw_video_file.unlink(missing_ok=True)
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(400, f"could not normalize reference video: {exc}")
+
     if audio:
         cleanup_paths.append(raw_video_path)
-    if use_vhs:
-        print(f"[ltx/motion] using VHS path (VHS_LoadVideo available)")
-        cleanup_paths.append(ref_video_path)
-        # Force workflow audio=False — LTX's audio synthesis path would
-        # generate a fresh soundtrack, but for motion control users want
-        # the REFERENCE's audio carried over. We mux it post-generation
-        # in run_job via _mux_reference_audio.
-        workflow = build_ltx_motion_workflow(
-            reference_video_filename=ref_video_filename,
-            character_image_filename=img_filename,
-            prompt=prompt, negative_prompt=negative_prompt,
-            width=width, height=height, length=length, fps=fps, seed=seed,
-            preset=preset, audio=False, enhance_prompt=enhance_prompt,
-            inplace_strength=inplace_strength, motion_strength=motion_strength,
-        )
+        audio_source_path = raw_video_path
     else:
-        # Extract every frame of the normalized clip into ComfyUI's input
-        # dir as individual PNGs. Chain runs to completion or raises 500
-        # if the frame count doesn't match what we asked ffmpeg for above.
-        print(f"[ltx/motion] using no-VHS fallback (extracting {length} frames)")
-        frame_dir_id = uuid.uuid4().hex[:8]
-        frame_pattern = f"ltx_motion_frame_{frame_dir_id}_%04d.png"
-        frame_extract_cmd = [
-            "ffmpeg", "-y", "-loglevel", "error", "-i", ref_video_path,
-            "-vsync", "0",
-            str(INPUT_DIR / frame_pattern),
-        ]
-
-        def _run_extract() -> subprocess.CompletedProcess:
-            return subprocess.run(frame_extract_cmd, check=True, capture_output=True, timeout=120)
-
-        try:
-            await asyncio.to_thread(_run_extract)
-        except subprocess.CalledProcessError as e:
-            stderr = (e.stderr or b"").decode(errors="replace")[:500]
-            Path(ref_video_path).unlink(missing_ok=True)
-            Path(img_path).unlink(missing_ok=True)
-            raise HTTPException(500, f"frame extraction failed: {stderr or 'ffmpeg failed'}")
-        except subprocess.TimeoutExpired:
-            Path(ref_video_path).unlink(missing_ok=True)
-            Path(img_path).unlink(missing_ok=True)
-            raise HTTPException(408, "frame extraction timed out")
-
-        # Collect the actual extracted frames (sorted) — ffmpeg starts at
-        # %04d=0001. If we got fewer than expected, log it but use what
-        # we have; the workflow only needs ≥2 frames to chain.
-        frame_files = sorted(INPUT_DIR.glob(f"ltx_motion_frame_{frame_dir_id}_*.png"))
-        if len(frame_files) < 2:
-            Path(ref_video_path).unlink(missing_ok=True)
-            Path(img_path).unlink(missing_ok=True)
-            raise HTTPException(500, f"frame extraction produced only {len(frame_files)} frames")
-        frame_filenames = [f.name for f in frame_files]
-        # Add every extracted frame to cleanup so we don't pile up files.
-        cleanup_paths.extend(str(f) for f in frame_files)
-        # Original ref video is now redundant — we've got the frames.
-        Path(ref_video_path).unlink(missing_ok=True)
-
-        # Same audio=False discipline as the VHS path — we mux ref audio
-        # after generation rather than synthesizing.
-        workflow = build_ltx_motion_workflow_no_vhs(
-            reference_frame_filenames=frame_filenames,
-            character_image_filename=img_filename,
-            prompt=prompt, negative_prompt=negative_prompt,
-            width=width, height=height, length=length, fps=fps, seed=seed,
-            preset=preset, audio=False, enhance_prompt=enhance_prompt,
-            inplace_strength=inplace_strength, motion_strength=motion_strength,
-        )
+        raw_video_file.unlink(missing_ok=True)
+        audio_source_path = None
 
     _reserve_video_job(job_id, cleanup_paths)
-    # audio_source_path is only set when audio=True — that triggers
-    # _mux_reference_audio inside run_job to carry the reference's
-    # original audio onto the silent video LTX produced.
-    audio_source_path = raw_video_path if audio else None
-    # trim_first_half is ALWAYS true for /ltx/motion — see the
-    # comment on node 330 in workflows.py:
-    # the IC-LoRA Union-Control guide keeps only the first ~40% of the
-    # decoded output reliably clean. The remainder eventually
-    # free-generates to colored noise, so never deliver that tail.
     background_tasks.add_task(
-        run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
-        audio_source_path, True,  # trim_first_half=True
+        run_motion_control_job,
+        job_id,
+        chunk_specs,
+        img_filename,
+        prompt,
+        negative_prompt,
+        width,
+        height,
+        seed,
+        inplace_strength,
+        motion_strength,
+        cleanup_paths,
+        audio_source_path=audio_source_path,
+        watermark_text=watermark,
+        watermark_image=watermark_image,
+        reference_duration_seconds=reference_duration,
+        target_frame_count=target_frame_count,
     )
     return {
-        "job_id": job_id, "status": "queued", "model": "ltx-2.3-22b",
+        "job_id": job_id,
+        "status": "queued",
+        "model": "ltx-2.3-22b",
         **_job_links(job_id),
         "workflow_path": "vhs" if use_vhs else "frame-extract",
-        "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
+        "reference_duration_seconds": round(reference_duration, 3),
+        "target_duration_seconds": round(target_frame_count / MOTION_FPS, 3),
+        "target_frames": target_frame_count,
+        "fps": MOTION_FPS,
+        "segments": len(chunk_specs),
         "audio_source": "reference" if audio else "none",
-        "note": "Output trimmed to the first ~40% clean IC-LoRA motion region.",
+        "note": (
+            "Output duration follows the reference video up to 15 seconds. "
+            "IC-LoRA guide padding is cropped before decode; no destructive "
+            "post-generation trim is applied."
+        ),
     }
 
 

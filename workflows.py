@@ -20,6 +20,53 @@ from typing import Callable, Iterable, Sequence
 from PIL import Image
 
 
+MOTION_FPS = 30
+MOTION_MAX_DURATION_SECONDS = 15.0
+MOTION_CHUNK_FRAMES = 121  # Four seconds at 30 fps, expressed as 8n + 1.
+
+
+def snap_ltx_frame_count(frame_count: int, *, minimum: int = 9) -> int:
+    """Round a frame count down to the nearest valid ``8n + 1`` value."""
+    frame_count = max(int(frame_count), minimum)
+    return ((frame_count - 1) // 8) * 8 + 1
+
+
+def duration_to_ltx_frames(
+    duration_seconds: float,
+    *,
+    fps: int = MOTION_FPS,
+    max_duration_seconds: float = MOTION_MAX_DURATION_SECONDS,
+) -> int:
+    """Convert a reference duration into a bounded, valid LTX frame count."""
+    bounded_duration = min(max(float(duration_seconds), 0.0), max_duration_seconds)
+    return snap_ltx_frame_count(round(bounded_duration * fps))
+
+
+def split_ltx_frame_count(
+    total_frames: int,
+    *,
+    max_chunk_frames: int = MOTION_CHUNK_FRAMES,
+) -> list[int]:
+    """Split a timeline into GPU-safe ``8n + 1`` overlapping chunks.
+
+    Adjacent chunks share one boundary frame. The joined frame count is
+    therefore ``sum(chunk - 1) + 1`` and stays equal to ``total_frames``.
+    """
+    total_frames = snap_ltx_frame_count(total_frames)
+    max_chunk_frames = snap_ltx_frame_count(max_chunk_frames)
+    if max_chunk_frames < 9:
+        raise ValueError("max_chunk_frames must allow at least one 8-frame interval")
+
+    remaining_intervals = total_frames - 1
+    chunk_intervals = max_chunk_frames - 1
+    chunks: list[int] = []
+    while remaining_intervals > 0:
+        intervals = min(remaining_intervals, chunk_intervals)
+        chunks.append(intervals + 1)
+        remaining_intervals -= intervals
+    return chunks or [9]
+
+
 # ─────────────────────────────────────────────
 # FLUX.2 Klein 9B — shared helpers
 # ─────────────────────────────────────────────
@@ -819,14 +866,14 @@ def build_ltx_t2v_workflow(prompt: str, negative_prompt: str,
 # (typically 97 frames) and downscale to the target resolution.
 # ─────────────────────────────────────────────
 
-def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
-                                     character_image_filename: str,
-                                     prompt: str, negative_prompt: str,
-                                     width: int, height: int, length: int, fps: int, seed: int,
-                                     preset: str = "fast", audio: bool = False,
-                                     enhance_prompt: bool = True,
-                                     inplace_strength: float = 0.5,
-                                     motion_strength: float = 1.0) -> dict:
+def _build_ltx_motion_workflow_no_vhs_legacy(reference_frame_filenames: list[str],
+                                             character_image_filename: str,
+                                             prompt: str, negative_prompt: str,
+                                             width: int, height: int, length: int, fps: int, seed: int,
+                                             preset: str = "fast", audio: bool = False,
+                                             enhance_prompt: bool = True,
+                                             inplace_strength: float = 0.5,
+                                             motion_strength: float = 1.0) -> dict:
     """Fallback motion-control workflow that doesn't need ComfyUI-VideoHelperSuite.
 
     Where the VHS variant uses one `VHS_LoadVideo` node to read the whole
@@ -964,6 +1011,74 @@ def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
         "strength": 1.0,
     }}
     workflow["242"]["inputs"]["images"] = ["280", 0]
+    return workflow
+
+
+def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
+                                     character_image_filename: str,
+                                     prompt: str, negative_prompt: str,
+                                     width: int, height: int, length: int, fps: int, seed: int,
+                                     preset: str = "fast", audio: bool = False,
+                                     enhance_prompt: bool = True,
+                                     inplace_strength: float = 0.5,
+                                     motion_strength: float = 1.0) -> dict:
+    """Build the same pose/IC-LoRA graph without VideoHelperSuite.
+
+    The previous fallback used a raw VAE video latent, so it copied the
+    reference person's appearance and did not match the production VHS path.
+    This fallback now differs only in how frames are loaded: stock LoadImage
+    and ImageBatch nodes replace VHS_LoadVideo, while DWPose, Union Control,
+    guide cropping, sampling, and decode remain identical.
+    """
+    if len(reference_frame_filenames) < 2:
+        raise ValueError(
+            f"motion workflow needs at least 2 reference frames; got {len(reference_frame_filenames)}"
+        )
+
+    workflow = build_ltx_motion_workflow(
+        reference_video_filename="__frame_batch__",
+        character_image_filename=character_image_filename,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        width=width,
+        height=height,
+        length=length,
+        fps=fps,
+        seed=seed,
+        preset=preset,
+        audio=audio,
+        enhance_prompt=enhance_prompt,
+        inplace_strength=inplace_strength,
+        motion_strength=motion_strength,
+    )
+    workflow.pop("310")  # Replace VHS_LoadVideo with a stock image batch.
+
+    load_base = 1000
+    batch_base = 2000
+    for index, filename in enumerate(reference_frame_filenames):
+        workflow[str(load_base + index)] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": filename},
+        }
+
+    workflow[str(batch_base)] = {
+        "class_type": "ImageBatch",
+        "inputs": {
+            "image1": [str(load_base), 0],
+            "image2": [str(load_base + 1), 0],
+        },
+    }
+    for index in range(2, len(reference_frame_filenames)):
+        workflow[str(batch_base + index - 1)] = {
+            "class_type": "ImageBatch",
+            "inputs": {
+                "image1": [str(batch_base + index - 2), 0],
+                "image2": [str(load_base + index), 0],
+            },
+        }
+
+    final_batch_id = str(batch_base + len(reference_frame_filenames) - 2)
+    workflow["311"]["inputs"]["input"] = [final_batch_id, 0]
     return workflow
 
 
@@ -1207,20 +1322,6 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── IC-LoRA guide (single, factor=2 from loader) ─────────
-        # PRAGMATIC v32: revert workflow to v25 setup. After 30+
-        # iterations we've shown the IC-LoRA guide consistently
-        # produces clean motion for roughly the first 40% of decoded
-        # frames, then collapses to noise. None
-        # of the workarounds (stacked guides → ghosting; standalone
-        # LTXVAddGuide → literal skeleton; LTXVAddGuidesFromBatch →
-        # 10-minute hang) deliver both temporal coverage AND
-        # character rendering simultaneously.
-        #
-        # So accept the limitation and TRIM the output in main.py to
-        # keep only the empirically clean first 40%. User asking for
-        # length=121 gets roughly 3.3s of clean rendered motion.
-        # That's a real, shippable result — better than chasing the
-        # unbounded "fix the second half" spiral.
         "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
             "positive": ["239", 0],
             "negative": ["239", 1],
@@ -1236,13 +1337,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "tile_overlap": 64,
         }},
 
-        # ─── Sparse character anchors (back to v36's sweet spot) ──
         # ─── Sampler chain ─────────────────────────────────────────
-        # No character anchors, no face swap, no temporal smoothing —
-        # those were post-v32 experiments that introduced ghosting,
-        # flicker, or both. v32 is the simplest config that produces
-        # a clean (but identity-drifty) clip with the IC-LoRA guide
-        # alone, trimmed to the first 40% clean conditioning window.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
             "positive": ["330", 0],
@@ -1262,9 +1357,21 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "latent_image": ["330", 2],
         }},
 
+        # LTXAddVideoICLoRAGuide appends guide tokens to the latent. They
+        # MUST be removed after sampling and before VAE decode. Omitting
+        # this official Lightricks step decoded the appended guide region
+        # as extra frames, which is why the old endpoint ended in colored
+        # diffusion noise and then tried to hide it with a destructive 40%
+        # ffmpeg trim.
+        "331": {"class_type": "LTXVCropGuides", "inputs": {
+            "positive": ["330", 0],
+            "negative": ["330", 1],
+            "latent": ["215", 0],
+        }},
+
         # ─── Decode + colour-match + output ───────────────────────
         "251": {"class_type": "VAEDecodeTiled", "inputs": {
-            "samples": ["215", 0],
+            "samples": ["331", 2],
             "vae": ["236", 2],
             "tile_size": 768, "overlap": 64,
             "temporal_size": 4096, "temporal_overlap": 4,

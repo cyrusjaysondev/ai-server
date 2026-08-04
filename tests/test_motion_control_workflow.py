@@ -1,8 +1,12 @@
-import ast
 import unittest
 from pathlib import Path
 
-from workflows import build_ltx_motion_workflow
+from workflows import (
+    build_ltx_motion_workflow,
+    build_ltx_motion_workflow_no_vhs,
+    duration_to_ltx_frames,
+    split_ltx_frame_count,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +37,9 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["310"]["inputs"]["video"], "dance.mp4")
         self.assertEqual(workflow["320"]["class_type"], "DWPreprocessor")
         self.assertEqual(workflow["330"]["class_type"], "LTXAddVideoICLoRAGuide")
+        self.assertEqual(workflow["331"]["class_type"], "LTXVCropGuides")
+        self.assertEqual(workflow["331"]["inputs"]["latent"], ["215", 0])
+        self.assertEqual(workflow["251"]["inputs"]["samples"], ["331", 2])
         self.assertEqual(workflow["269"]["inputs"]["image"], "character.png")
         self.assertEqual(workflow["325"]["inputs"]["strength"], 0.5)
         self.assertEqual(workflow["330"]["inputs"]["strength"], 1.0)
@@ -55,18 +62,40 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["239"]["inputs"]["frame_rate"], 30.0)
         self.assertEqual(workflow["310"]["inputs"]["force_rate"], 30.0)
 
-    def test_clean_tail_fraction_stays_at_empirical_boundary(self):
-        tree = ast.parse((REPO_ROOT / "main.py").read_text())
-        assignments = {
-            target.id: ast.literal_eval(node.value)
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            for target in node.targets
-            if isinstance(target, ast.Name)
-            and target.id == "_MOTION_CLEAN_FRACTION"
-        }
+    def test_frame_loader_fallback_uses_the_same_pose_and_crop_graph(self):
+        workflow = build_ltx_motion_workflow_no_vhs(
+            reference_frame_filenames=["frame-1.png", "frame-2.png", "frame-3.png"],
+            character_image_filename="character.png",
+            prompt="dance",
+            negative_prompt="",
+            width=544,
+            height=960,
+            length=121,
+            fps=30,
+            seed=7,
+        )
 
-        self.assertEqual(assignments["_MOTION_CLEAN_FRACTION"], 0.40)
+        self.assertNotIn("310", workflow)
+        self.assertEqual(workflow["320"]["class_type"], "DWPreprocessor")
+        self.assertEqual(workflow["330"]["class_type"], "LTXAddVideoICLoRAGuide")
+        self.assertEqual(workflow["331"]["class_type"], "LTXVCropGuides")
+        self.assertEqual(workflow["311"]["inputs"]["input"], ["2001", 0])
+
+    def test_fifteen_second_reference_is_split_without_losing_frames(self):
+        total_frames = duration_to_ltx_frames(15.0)
+        chunks = split_ltx_frame_count(total_frames)
+
+        self.assertEqual(total_frames, 449)
+        self.assertEqual(chunks, [121, 121, 121, 89])
+        self.assertEqual(sum(chunk - 1 for chunk in chunks) + 1, total_frames)
+        self.assertTrue(all((chunk - 1) % 8 == 0 for chunk in chunks))
+
+    def test_motion_route_no_longer_contains_destructive_tail_trim(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertNotIn("trim_first_half", main_source)
+        self.assertNotIn("_MOTION_CLEAN_FRACTION", main_source)
+        self.assertIn("match_reference_duration", main_source)
 
     def test_setup_provisions_every_live_dependency(self):
         setup = (REPO_ROOT / "setup.sh").read_text()
