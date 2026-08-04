@@ -1904,7 +1904,7 @@ async def ltx_motion_control(
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
     prompt: str = Form("", description="Free-form action description. The server combines it with an image-aware description of the uploaded character so visible identity traits persist through motion."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
-    preset: str = Form("quality", description="Motion quality preset: quality (default, two-stage learned upscale + refine for better faces, eyes, and hands) or fast (single-stage 8-step render)."),
+    preset: str = Form("fast", description="Motion quality preset: fast (default, single-stage 8-step render with the strongest identity consistency) or quality (optional learned 2x upscale + refine; slower and best when the uploaded photo closely matches the reference framing)."),
     aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     width: int = Form(544, description="Requested output width; height follows aspect_ratio. Quality mode renders a smaller first pass and delivers a learned 2× upscale (about 640×1152 for the default 9:16 request)."),
     height: int = Form(960, description="Only used when aspect_ratio=original."),

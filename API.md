@@ -577,7 +577,7 @@ skin tone, and clothing.
 | `image` | file | **required** | Character image to animate; a clear full-body image works best |
 | `prompt` | string | `""` | Action description; the server combines it with an image-aware description of the uploaded character |
 | `negative_prompt` | string | *server default* | Artifacts and traits to avoid |
-| `preset` | string | `quality` | `quality` uses a half-resolution 8-step pass, learned 2× upscale, and 3-step full-resolution refine for better eyes, faces, and hands. `fast` keeps the single-stage 8-step path. |
+| `preset` | string | `fast` | `fast` is the production default: a single-stage 8-step render with the strongest tested identity consistency. `quality` adds a learned 2× upscale and 3-step refinement; it is slower and works best when the uploaded photo closely matches the reference framing. |
 | `aspect_ratio` | string | `9:16` | Output aspect ratio |
 | `width` | int | `544` | Requested width; dimensions snap to IC-LoRA-safe multiples of 64 |
 | `height` | int | `960` | Used with `aspect_ratio=original`; otherwise the ratio determines it |
@@ -599,11 +599,12 @@ between adjacent segments, and joins them into one continuous result. After
 every sample, the server runs the required `LTXVCropGuides` node before VAE
 decode, so IC-LoRA padding is not exposed as noisy frames. No percentage-based
 post-generation trim is applied. Status polling reports overall segment-aware
-progress and a whole-job ETA; a full 15-second render on the current 22B GPU
-typically takes about 8–12 minutes, while shorter templates complete sooner.
-Quality mode also disables reference facial landmarks and raises DWPose
-hand/body tracking resolution. The learned upscaled latent carries the original
-character identity into the refinement pass without a conflicting second anchor.
+progress and a whole-job ETA. In the measured production test, the default path
+rendered 3.77 seconds in about 2.5 minutes; a complete 15-second template takes
+roughly 9–11 minutes depending on pod load. Reference facial landmarks are
+disabled to prevent eye warping, while DWPose hand/body tracking runs at higher
+resolution. The optional refinement preset takes longer and should be reserved
+for inputs whose framing closely matches the reference video.
 
 ### Submit, poll, and download
 
@@ -618,7 +619,7 @@ RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
   -F "height=960" \
   -F "match_reference_duration=true" \
   -F "max_duration_seconds=15" \
-  -F "preset=quality" \
+  -F "preset=fast" \
   -F "audio=true" \
   -F "inplace_strength=1.0" \
   -F "motion_strength=1.0")

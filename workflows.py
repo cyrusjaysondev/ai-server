@@ -1182,8 +1182,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         reference audio post-generation).
       • `quality` uses an 8-step half-resolution IC-LoRA pass, the official
         LTX 2× latent upscaler, and a 3-step full-resolution refine pass.
-        This improves small faces, eyes, and hands without doubling the
-        expensive first-pass sampling cost.
+        It is opt-in because the extra denoising can trade some identity
+        consistency for detail when input and reference framing differ.
       • Image-aware Gemma prompting is always enabled for identity safety.
     """
     _ = audio, enhance_prompt
@@ -1498,7 +1498,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # Two-stage motion quality path. Stage 1 handles the expensive temporal
         # generation on the smaller canvas. The learned LTX upscaler and a
         # short full-resolution re-guided pass recover facial, eye, and hand
-        # detail while keeping the same identity and motion controls.
+        # detail while keeping the same motion controls. This path is opt-in:
+        # fast mode retained identity better in mismatched-framing live tests.
         workflow.update({
             "322": {"class_type": "ResizeImageMaskNode", "inputs": {
                 "input": ["320", 0],
