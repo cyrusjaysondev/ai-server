@@ -575,7 +575,7 @@ skin tone, and clothing.
 |-------|------|---------|-------------|
 | `reference_video` | file | **required** | Video containing the body motion to copy |
 | `image` | file | **required** | Character image to animate; a clear full-body image works best |
-| `prompt` | string | `""` | Literal description of the character and action |
+| `prompt` | string | `""` | Action description; the server combines it with an image-aware description of the uploaded character |
 | `negative_prompt` | string | *server default* | Artifacts and traits to avoid |
 | `preset` | string | `fast` | Accepted for compatibility; the fixed 8-step IC-LoRA workflow is used |
 | `aspect_ratio` | string | `9:16` | Output aspect ratio |
@@ -587,7 +587,7 @@ skin tone, and clothing.
 | `max_duration_seconds` | float | `15` | Maximum reference duration to render (1–15 seconds) |
 | `seed` | int | `-1` | Random when `-1`; set a value for repeatability |
 | `audio` | bool | `false` | Mux the reference video's original audio onto the result |
-| `enhance_prompt` | bool | `true` | Accepted for compatibility; ignored for motion control |
+| `enhance_prompt` | bool | `true` | Accepted for compatibility; image-aware identity enhancement is always enabled for motion control |
 | `inplace_strength` | float | `1.0` | Character identity-anchor strength. The server enforces an exact `1.0` lock and derives an image-aware appearance prompt to prevent identity and apparent-gender drift. |
 | `motion_strength` | float | `1.0` | DWPose motion-guide strength (0–1) |
 | `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
