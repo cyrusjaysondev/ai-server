@@ -24,6 +24,7 @@ Interactive docs (Swagger UI): `https://YOUR_POD_ID-7860.proxy.runpod.net/docs`
 | DELETE | `/admin/blocklist-logos/{identity}` | Remove a blocked logo/flag |
 | GET | `/admin/blocklist-logos/{identity}/image` | Preview a blocked logo image |
 | POST | `/ltx/i2v` | Image to video (LTX 2.3) |
+| POST | `/ltx/motion` | Copy a reference video's body motion onto a character image |
 | POST | `/ltx/t2v` | Text to video (LTX 2.3) |
 | POST | `/face-animate` | Face swap + animate pipeline |
 | GET | `/ltx/presets` | List available speed/quality presets |
@@ -558,6 +559,86 @@ curl -X POST .../ltx/i2v \
 
 ---
 
+## POST /ltx/motion — Motion Control
+
+Copy the body motion from a reference video onto a separate character image.
+The endpoint extracts a DWPose skeleton from the video and uses LTX 2.3
+Union-Control IC-LoRA to render the character following that pose. The
+reference person's face, clothing, and background are not used as appearance
+inputs.
+
+### Parameters
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `reference_video` | file | **required** | Video containing the body motion to copy |
+| `image` | file | **required** | Character image to animate; a clear full-body image works best |
+| `prompt` | string | `""` | Literal description of the character and action |
+| `negative_prompt` | string | *server default* | Artifacts and traits to avoid |
+| `preset` | string | `fast` | Accepted for compatibility; the fixed 8-step IC-LoRA workflow is used |
+| `aspect_ratio` | string | `9:16` | Output aspect ratio |
+| `width` | int | `544` | Requested width; dimensions snap to IC-LoRA-safe multiples of 64 |
+| `height` | int | `960` | Used with `aspect_ratio=original`; otherwise the ratio determines it |
+| `length` | int | `121` | Motion frame budget; larger values increase duration and generation time |
+| `fps` | int | `24` | Accepted for compatibility; motion processing and output use 30 fps |
+| `seed` | int | `-1` | Random when `-1`; set a value for repeatability |
+| `audio` | bool | `false` | Mux the reference video's original audio onto the result |
+| `enhance_prompt` | bool | `true` | Accepted for compatibility; ignored for motion control |
+| `inplace_strength` | float | `0.5` | Character identity-anchor strength (0–1) |
+| `motion_strength` | float | `1.0` | DWPose motion-guide strength (0–1) |
+| `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
+| `require_detectable_face` | bool | `false` | Require a detectable face in the character image |
+
+The IC-LoRA guide becomes unstable near the decoded tail. The server keeps
+only the first 40% clean conditioning window and removes the colored-noise
+tail before returning the video.
+
+### Submit, poll, and download
+
+```bash
+# 1. Submit the motion job.
+RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
+  -F "reference_video=@dance-reference.mp4" \
+  -F "image=@character.png" \
+  -F "prompt=the woman performs the reference dance, full body" \
+  -F "aspect_ratio=9:16" \
+  -F "width=544" \
+  -F "height=960" \
+  -F "length=121" \
+  -F "audio=true" \
+  -F "inplace_strength=0.5" \
+  -F "motion_strength=1.0")
+
+echo "$RESPONSE" | python3 -m json.tool
+POLL_URL=$(echo "$RESPONSE" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["poll_url"])')
+
+# 2. Poll until completed or failed.
+while true; do
+  STATUS=$(curl -sS "$POLL_URL")
+  STATE=$(echo "$STATUS" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["status"])')
+  echo "$STATE"
+  if [ "$STATE" = "completed" ] || [ "$STATE" = "failed" ]; then
+    echo "$STATUS" | python3 -m json.tool
+    break
+  fi
+  sleep 5
+done
+
+# 3. Download the public URL returned on completion.
+VIDEO_URL=$(echo "$STATUS" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["url"])')
+curl -L "$VIDEO_URL" -o motion-result.mp4
+```
+
+Queued submissions return `job_id`, `status`, `poll_url`, and `cancel_url`.
+Completed status responses include `url`, `filename`, `thumbnail_url`, and
+generation `duration_seconds`. Cancel an active job with
+`DELETE /jobs/{job_id}/cancel`.
+
+---
+
 ## POST /ltx/t2v — Text to Video
 
 Generate a video from a text prompt using LTX 2.3. No input image required.
@@ -698,9 +779,9 @@ curl https://YOUR_POD_ID-7860.proxy.runpod.net/status/{job_id}
 }
 ```
 
-> `thumbnail_url` is present only on video outputs (the four endpoints
-> `/ltx/i2v`, `/ltx/t2v`, `/face-animate`, plus any future video
-> workflows). It's the first frame as a JPG, served from the same domain.
+> `thumbnail_url` is present only on video outputs (`/ltx/i2v`, `/ltx/t2v`,
+> `/ltx/motion`, `/face-animate`, and future video workflows). It's the first
+> frame as a JPG, served from the same domain.
 > If a watermark was applied, the thumbnail reflects it.
 
 **Completed (image)**
@@ -788,6 +869,7 @@ curl .../videos
 | T2V / I2V (544×960, 4s) | ~12s | ~12s |
 | T2V / I2V (544×960, 5s) | ~14s | ~14s |
 | T2V / I2V (768×1344, 5s) | ~22s | ~24s |
+| Motion control (544×960, length 121) | ~5–6 min | Fixed IC-LoRA workflow |
 | Face animate (544×960, 4s) | ~35s (swap + video) | ~35s |
 
 > **Both presets land at roughly the same wall time** because `quality` does most of its work at half-resolution (8 steps at ~128k pixels → 2× spatial upscale → 3 refine steps at full-res). Use `quality` when you want sharper detail at no real speed cost; use `fast` for the simpler single-pass pipeline.

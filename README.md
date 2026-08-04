@@ -75,8 +75,8 @@ bash /tmp/setup.sh
 `setup.sh` runs 4 steps:
 
 1. **Install pip deps + aria2** (~5 s)
-2. **Download all 9 models in parallel via aria2** (~72 GB; resumable, skips anything already on the volume)
-3. **Install LanPaint custom node** (skipped if already present)
+2. **Download all 10 models in parallel via aria2** (~73 GB; resumable, skips anything already on the volume)
+3. **Install required custom nodes** (LanPaint, KJNodes, VideoHelperSuite, LTXVideo, and DWPose) and pin the compatible Kornia version
 4. **Fetch `main.py`, install the ComfyUI bootstrap custom node, launch the API supervisor**
 
 **First deploy: ~3–10 minutes** on a warm HuggingFace CDN (parallel aria2 at 200–500 MB/s beats serial wget by 30–50×).
@@ -400,7 +400,7 @@ cd /workspace/runpod-slim/ComfyUI && \
 
 ---
 
-## Models (~72 GB total)
+## Models (~73 GB total)
 
 | Model | Size | Purpose | HF token |
 |-------|------|---------|----------|
@@ -410,6 +410,7 @@ cd /workspace/runpod-slim/ComfyUI && \
 | BFS Head Swap LoRA | 633 MB | Head swap LoRA | No |
 | LTX-2.3 22B checkpoint | 27 GB | Video gen | Yes (gated) |
 | LTX-2.3 distilled LoRA | 7.1 GB | LTX speed LoRA | No |
+| LTX-2.3 Union-Control IC-LoRA | 624 MB | Motion transfer control | No |
 | Gemma abliterated LoRA | 599 MB | LTX prompt LoRA | No |
 | Gemma 3 12B text encoder | 8.8 GB | LTX text encoder | No |
 | LTX-2.3 spatial upscaler | 950 MB | 2× spatial upscaler | No |
@@ -431,7 +432,7 @@ cd /workspace/runpod-slim/ComfyUI && \
         diffusion_models/  # FLUX UNET
         vae/               # FLUX VAE
         text_encoders/     # Qwen 3 8B, Gemma 12B
-        loras/             # BFS, distilled LTX, Gemma abliterated
+        loras/             # BFS, distilled + Union-Control LTX, Gemma abliterated
         checkpoints/       # LTX 2.3 22B
         latent_upscale_models/  # LTX spatial upscaler
       custom_nodes/

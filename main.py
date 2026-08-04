@@ -333,7 +333,7 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     return True, "ok"
 
 
-_MOTION_CLEAN_FRACTION = 0.50  # v32 value — IC-LoRA conditioning window
+_MOTION_CLEAN_FRACTION = 0.40  # empirically clean IC-LoRA conditioning window
 
 
 def _trim_first_half(video_path: Path) -> tuple[bool, str]:
@@ -1020,7 +1020,7 @@ async def run_job(job_id: str, workflow: dict, cleanup_paths: list = None,
                         if trim_warning:
                             completed["trim_warning"] = trim_warning
                         elif trim_first_half:
-                            completed["trimmed"] = "first_half_only"
+                            completed["trimmed"] = "clean_motion_region_40_percent"
                         if jobs.get(job_id, {}).get("status") != "cancelled":
                             jobs[job_id] = completed
                         return
@@ -1680,9 +1680,9 @@ async def ltx_text_to_video(
 #
 # Take a character image + a reference video of motion (dance, gesture,
 # action) and produce a new video where the character does what the
-# reference does. The reference video's motion structure is baked into
-# the LTX latent space via VAE-encoded frames; the character image is
-# mixed in via the same LTXVImgToVideoInplace node /ltx/i2v uses.
+# reference does. DWPose extracts only the reference person's skeleton;
+# LTX Union-Control IC-LoRA applies that motion to the character image
+# without copying the reference person's face or clothes.
 #
 # Reference video constraints:
 #   - Caller can upload any length / resolution; we trim to `length`
@@ -1698,19 +1698,19 @@ async def ltx_motion_control(
     background_tasks: BackgroundTasks,
     reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. Any length/resolution accepted — server trims and downscales to fit LTX's frame budget."),
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
-    prompt: str = Form("", description="Free-form description of the action. Enhanced by Gemma using the character image as context unless enhance_prompt=false."),
+    prompt: str = Form("", description="Free-form description of the character and action. The motion workflow uses it directly; enhance_prompt is accepted for API compatibility but ignored."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
-    preset: str = Form("fast", description="Speed/quality preset: realtime (4 steps), fast (8 steps), or quality (8+3 steps two-pass)"),
+    preset: str = Form("fast", description="Accepted for API compatibility. Motion control currently uses the fixed 8-step distilled IC-LoRA workflow."),
     aspect_ratio: str = Form("9:16", description="Output aspect ratio: original | 16:9 | 9:16 | 1:1 | 4:3 | 3:4 | 3:2 | 2:3 | 21:9 | 9:21"),
     width: int = Form(544, description="Output width — height is derived from aspect_ratio. For 9:16 dance refs the 544×960 fast / 720×1280 quality presets are tuned for clean motion."),
     height: int = Form(960, description="Only used when aspect_ratio=original."),
     length: int = Form(121, description="Number of output frames (also caps reference-video frames pulled in). 97≈4s, 121≈5s, 161≈6.7s @24fps."),
-    fps: int = Form(24, description="Frames per second for both reference decode and output."),
+    fps: int = Form(24, description="Accepted for API compatibility. The IC-LoRA motion timeline runs at 30 fps."),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
-    enhance_prompt: bool = Form(True, description="Rewrite the prompt via Gemma using the character image as visual context. Recommended ON unless you've written a long detailed motion description yourself."),
-    inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Identity-anchor strength for LTXVAddGuide on the character image. 1.0 = locks first frame to character image (identity dominates, motion fights it). 0.5 = balanced. 0.1-0.2 = motion dominates (best dance match, identity drift possible). 0.0 = no identity anchor."),
-    motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="LTXVAddGuide strength for the reference video. 1.0 = full motion conditioning (recommended). <1.0 attenuates."),
+    enhance_prompt: bool = Form(True, description="Accepted for API compatibility; currently ignored by the IC-LoRA motion workflow."),
+    inplace_strength: float = Form(0.5, ge=0.0, le=1.0, description="Character-image identity anchor. 1.0 locks appearance most strongly; 0.5 balances identity and motion."),
+    motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="DWPose IC-LoRA guide strength. 1.0 follows the reference motion most closely."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),
     face_filter: bool = Form(True, description="Reject the character image when it matches a blocked face identity. Enabled by default."),
@@ -1720,15 +1720,15 @@ async def ltx_motion_control(
 
     Pipeline:
       1. Save uploaded reference video + character image to ComfyUI input dir.
-      2. ffmpeg normalize the reference: resample to `fps`, trim to `length`
-         frames, downscale to fit the target canvas, strip audio (saves
-         VAE-encode time + VRAM for refs that arrive as 4K phone clips).
-      3. Build the LTX motion workflow — VHS_LoadVideo reads the normalized
-         clip, the LTX VAE encodes its frames into a motion latent,
-         LTXVAddGuide mixes the character image identity in, and the
-         standard LTX sampler denoises toward the prompt + image.
+      2. ffmpeg normalize the reference to the fixed 30 fps IC-LoRA timeline,
+         trim to `length` frames, downscale it, and strip audio.
+      3. VHS_LoadVideo + DWPose turn the reference into pose-only frames.
+         Union-Control IC-LoRA combines that pose guide with the separate
+         character-image identity anchor, then LTX renders the new subject.
       4. Enqueue as a background job; client polls /status/<job_id>.
-      5. (If audio=True) After ComfyUI returns the silent output video,
+      5. Keep the first 40% clean conditioning window so the unstable
+         colored-noise tail is never delivered.
+      6. (If audio=True) After ComfyUI returns the silent output video,
          ffmpeg-mux the ORIGINAL reference's audio onto it — looping the
          audio with -stream_loop -1 if the source is shorter than the
          output, trimming with -shortest. The LTX audio-synthesis path is
@@ -1946,10 +1946,9 @@ async def ltx_motion_control(
     audio_source_path = raw_video_path if audio else None
     # trim_first_half is ALWAYS true for /ltx/motion — see the
     # comment on node 330 in workflows.py:
-    # the IC-LoRA Union-Control guide conditions only the first ~50%
-    # of output latent slices, the second half free-generates to
-    # colored noise. Trimming gives the user a coherent ~half-length
-    # clip rather than a half-broken full-length one.
+    # the IC-LoRA Union-Control guide keeps only the first ~40% of the
+    # decoded output reliably clean. The remainder eventually
+    # free-generates to colored noise, so never deliver that tail.
     background_tasks.add_task(
         run_job, job_id, workflow, cleanup_paths, watermark, watermark_image,
         audio_source_path, True,  # trim_first_half=True
@@ -1960,7 +1959,7 @@ async def ltx_motion_control(
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "ref_video_normalized_to": {"width": width, "height": height, "fps": fps, "max_frames": length},
         "audio_source": "reference" if audio else "none",
-        "note": "Output trimmed to first ~50% (IC-LoRA conditioning limit). Request 2× the desired duration in `length`.",
+        "note": "Output trimmed to the first ~40% clean IC-LoRA motion region.",
     }
 
 

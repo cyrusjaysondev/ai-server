@@ -83,7 +83,7 @@ class H(http.server.BaseHTTPRequestHandler):
             "status": "installing",
             "message": (
                 "AI Gen API v2 is still setting up. First deploy downloads "
-                "~72 GB of models (3-10 min on warm HF CDN). /health will "
+                "~73 GB of models (3-10 min on warm HF CDN). /health will "
                 "return HTTP 200 once uvicorn is bound."
             ),
             "pod_id": os.environ.get('RUNPOD_POD_ID', 'unknown'),
@@ -209,9 +209,9 @@ log "  Done"
 # 2. Download all models in parallel via aria2
 #    (Previously 6 serial wget phases → single parallel phase.
 #     HF CDN routing + 16 connections/file yields 200–500 MB/s
-#     vs ~1 MB/s serial wget. Full 72 GB in ~3–10 min, not hours.)
+#     vs ~1 MB/s serial wget. Full 73 GB in ~3–10 min, not hours.)
 # ─────────────────────────────────────────────
-log "[2/4] Downloading models (parallel, ~72 GB total)..."
+log "[2/4] Downloading models (parallel, ~73 GB total)..."
 mkdir -p "$MODELS/diffusion_models" "$MODELS/vae" "$MODELS/vae_approx" "$MODELS/text_encoders" \
          "$MODELS/loras" "$MODELS/checkpoints" "$MODELS/latent_upscale_models"
 
@@ -235,6 +235,9 @@ https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.s
 https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors
   dir=$MODELS/loras
   out=ltx-2.3-22b-distilled-lora-384.safetensors
+https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors
+  dir=$MODELS/loras
+  out=ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors
 https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
   dir=$MODELS/loras
   out=gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
@@ -289,6 +292,7 @@ text_encoders/qwen_3_8b_fp8mixed.safetensors|https://huggingface.co/Comfy-Org/fl
 loras/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors|https://huggingface.co/Alissonerdx/BFS-Best-Face-Swap/resolve/main/bfs_head_v1_flux-klein_9b_step3500_rank128.safetensors
 checkpoints/ltx-2.3-22b-dev-fp8.safetensors|https://huggingface.co/Lightricks/LTX-2.3-fp8/resolve/main/ltx-2.3-22b-dev-fp8.safetensors
 loras/ltx-2.3-22b-distilled-lora-384.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-distilled-lora-384.safetensors
+loras/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors|https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control/resolve/main/ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors
 loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/loras/gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors
 text_encoders/gemma_3_12B_it_fp4_mixed.safetensors|https://huggingface.co/Comfy-Org/ltx-2/resolve/main/split_files/text_encoders/gemma_3_12B_it_fp4_mixed.safetensors
 latent_upscale_models/ltx-2.3-spatial-upscaler-x2-1.0.safetensors|https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-spatial-upscaler-x2-1.0.safetensors"
@@ -336,7 +340,7 @@ fi
 (cd "$MODELS/diffusion_models" && \
  ln -sfn flux2-klein-9b.safetensors flux-2-klein-9b.safetensors)
 
-log "  All 9 models verified at expected sizes"
+log "  All 10 models verified at expected sizes"
 
 # ─────────────────────────────────────────────
 # 2b. Brand assets (Metfone GenAI logo for the watermark_image option)
@@ -543,6 +547,49 @@ VHS_LOG="/workspace/setup-vhs.log"
   fi
 } >>"$VHS_LOG" 2>&1
 log "  (VHS install details: tail -200 $VHS_LOG)"
+
+# Motion-control dependencies. ComfyUI-LTXVideo supplies the IC-LoRA
+# loader/guide nodes; comfyui_controlnet_aux supplies DWPreprocessor. Both
+# are required by /ltx/motion. Always pull + reinstall so a partial clone or
+# stale checkout cannot silently leave the endpoint broken.
+#
+# ComfyUI-LTXVideo currently imports `pad` from Kornia's legacy pyramid API.
+# Kornia 0.8.x removed that symbol and makes the entire node pack fail to
+# import, so pin 0.6.12 AFTER installing both node packs' requirements.
+MOTION_NODES_LOG="/workspace/setup-motion-nodes.log"
+{
+  echo "=== motion-node install run: $(date -u +%FT%TZ) ==="
+  install_motion_node() {
+    local repo="$1" name="$2" dir="$NODES/$2"
+    if [ ! -d "$dir/.git" ]; then
+      log "  Installing $name (clean clone)..."
+      rm -rf "$dir"
+      (cd "$NODES" && git clone "$repo" "$name") || return 1
+    else
+      log "  $name: git pull (refresh)"
+      (cd "$dir" && git pull --ff-only) || return 1
+    fi
+    if [ -f "$dir/requirements.txt" ]; then
+      $PIP install -r "$dir/requirements.txt" || return 1
+    fi
+  }
+
+  install_motion_node \
+    "https://github.com/Lightricks/ComfyUI-LTXVideo" \
+    "ComfyUI-LTXVideo" || \
+    log "  ⚠️  ComfyUI-LTXVideo install failed — /ltx/motion will not work"
+  install_motion_node \
+    "https://github.com/Fannovel16/comfyui_controlnet_aux" \
+    "comfyui_controlnet_aux" || \
+    log "  ⚠️  comfyui_controlnet_aux install failed — DWPreprocessor unavailable"
+
+  log "  Pinning Kornia 0.6.12 for ComfyUI-LTXVideo compatibility..."
+  $PIP install --no-deps --force-reinstall "kornia==0.6.12" || \
+    log "  ⚠️  Kornia pin failed — ComfyUI-LTXVideo may fail to import"
+  $PYTHON -c 'import kornia; from kornia.geometry.transform.pyramid import pad; print("Kornia", kornia.__version__, "pad import OK")' || \
+    log "  ⚠️  Kornia compatibility check failed"
+} >>"$MOTION_NODES_LOG" 2>&1
+log "  (motion-node install details: tail -200 $MOTION_NODES_LOG)"
 
 # (The conditional LanPaint-only ComfyUI relaunch that used to live here
 # is now subsumed by the start_comfy.sh supervisor below: it unconditionally

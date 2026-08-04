@@ -1209,16 +1209,16 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # ─── IC-LoRA guide (single, factor=2 from loader) ─────────
         # PRAGMATIC v32: revert workflow to v25 setup. After 30+
         # iterations we've shown the IC-LoRA guide consistently
-        # produces clean Marco-dancing for the first ~50% of output
-        # frames, then collapses to noise for the second half. None
+        # produces clean motion for roughly the first 40% of decoded
+        # frames, then collapses to noise. None
         # of the workarounds (stacked guides → ghosting; standalone
         # LTXVAddGuide → literal skeleton; LTXVAddGuidesFromBatch →
         # 10-minute hang) deliver both temporal coverage AND
         # character rendering simultaneously.
         #
         # So accept the limitation and TRIM the output in main.py to
-        # keep only the clean first half. User asking for length=121
-        # (~5s) gets ~4s of cleanly-rendered Marco doing the motion.
+        # keep only the empirically clean first 40%. User asking for
+        # length=121 gets roughly 3.3s of clean rendered motion.
         # That's a real, shippable result — better than chasing the
         # unbounded "fix the second half" spiral.
         "330": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
@@ -1242,7 +1242,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # those were post-v32 experiments that introduced ghosting,
         # flicker, or both. v32 is the simplest config that produces
         # a clean (but identity-drifty) clip with the IC-LoRA guide
-        # alone, trimmed to first ~50% (the conditioning window).
+        # alone, trimmed to the first 40% clean conditioning window.
         "231": {"class_type": "CFGGuider", "inputs": {
             "model": ["262", 0],
             "positive": ["330", 0],

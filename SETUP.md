@@ -87,11 +87,11 @@ You should see output like:
 [HH:MM:SS] ==========================================
 [HH:MM:SS] [1/4] Installing pip dependencies + aria2...
 [HH:MM:SS]   Done
-[HH:MM:SS] [2/4] Downloading models (parallel, ~72 GB total)...
+[HH:MM:SS] [2/4] Downloading models (parallel, ~73 GB total)...
 [HH:MM:SS]   Download complete: /workspace/runpod-slim/ComfyUI/models/...
 [HH:MM:SS]   Verifying downloaded files against HF expected sizes...
-[HH:MM:SS]   All 9 models verified at expected sizes
-[HH:MM:SS] [3/4] Installing LanPaint custom node...
+[HH:MM:SS]   All 10 models verified at expected sizes
+[HH:MM:SS] [3/4] Installing required ComfyUI custom nodes...
 [HH:MM:SS] [4/4] Setting up API...
 [HH:MM:SS]   main.py downloaded (latest)
 [HH:MM:SS]   /start.sh patched with API restart hook
@@ -128,7 +128,7 @@ bash /tmp/setup.sh
 
 > **Why two lines and not one `&&`-chained line?** Some terminals wrap long commands at inconvenient points when you paste them, which splits `&& bash` from its argument and leaves you dropped into a nested interactive shell. Two separate commands can't be split that way.
 
-Setup finishes in ~15–20 s on a volume with cached models (first-ever deploy: 3–10 min while it downloads 72 GB). `setup.sh` also patches `/start.sh` with a restart hook, so **subsequent pod restarts of this same pod** will auto-start the API without you running anything — even without a template fix. The template Start Command only matters for **fresh pods** (new container, new or reused volume).
+Setup finishes quickly on a volume with cached models (first-ever deploy: 3–10 min while it downloads 73 GB). `setup.sh` also patches `/start.sh` with a restart hook, so **subsequent pod restarts of this same pod** will auto-start the API without you running anything — even without a template fix. The template Start Command only matters for **fresh pods** (new container, new or reused volume).
 
 Then go fix the template so your next fresh pod is truly hands-off — see [the template troubleshooting block](#api-didnt-come-back-after-pod-restart).
 
@@ -313,7 +313,7 @@ die if the shell exits. `setsid nohup … </dev/null &` fully detaches.
 1. Create your template once (Step 1 above)
 2. Deploy as many pods as you need — each runs the same setup
 3. Push API updates to the repo — all pods pick up changes on restart
-4. Models are cached on each pod's volume — only first deploy downloads ~72 GB
+4. Models are cached on each pod's volume — only first deploy downloads ~73 GB
 
 ### Recommended scaling setup
 
@@ -434,10 +434,11 @@ Two fixes:
 | BFS Head Swap LoRA | 633 MB | Alissonerdx/BFS-Best-Face-Swap | No |
 | LTX-2.3 22B checkpoint | 27 GB | Lightricks/LTX-2.3-fp8 | Yes (gated) |
 | LTX-2.3 distilled LoRA | 7.1 GB | Lightricks/LTX-2.3 | No |
+| LTX-2.3 Union-Control IC-LoRA | 624 MB | Lightricks/LTX-2.3-22b-IC-LoRA-Union-Control | No |
 | Gemma abliterated LoRA | 599 MB | Comfy-Org/ltx-2 | No |
 | Gemma 3 12B text encoder | 8.8 GB | Comfy-Org/ltx-2 | No |
 | LTX-2.3 spatial upscaler | 950 MB | Lightricks/LTX-2.3 | No |
-| **Total** | **~72 GB** | | |
+| **Total** | **~73 GB** | | |
 
 > Recommended volume size: **200 GB** to have room for generated outputs.
 
