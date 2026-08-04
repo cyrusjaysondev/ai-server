@@ -36,7 +36,7 @@ FILES_TO_REFRESH = (
     "logo_safety.py",
     "watermark.py",
 )
-MARKER = Path("/tmp/api-refresh-claimed-motion-identity-v58")
+MARKER = Path("/tmp/api-refresh-claimed-motion-identity-v59")
 DIAG_LOG = Path("/workspace/setup-vhs.log")
 
 

@@ -866,7 +866,7 @@ def build_ltx_t2v_workflow(prompt: str, negative_prompt: str,
 # (typically 97 frames) and downscale to the target resolution.
 # ─────────────────────────────────────────────
 
-MOTION_IDENTITY_MIN_STRENGTH = 0.9
+MOTION_IDENTITY_MIN_STRENGTH = 1.0
 
 MOTION_IDENTITY_PROMPT = (
     "IDENTITY LOCK: The character image is the only source for the subject's "
@@ -1188,9 +1188,10 @@ def build_ltx_motion_workflow(reference_video_filename: str,
     # so does LTXVImgToVideoConditionOnly.
     motion_strength = max(0.0, min(1.0, motion_strength))
     # Motion control promises to animate the uploaded person, not invent a
-    # demographically similar replacement. Values below 0.9 caused confirmed
-    # production drift (a woman became a bearded man while clothing colour was
-    # retained), so identity anchoring has a safe floor for every caller.
+    # demographically similar replacement. A production test confirmed that
+    # even 0.9 could turn a woman into a male subject while retaining only her
+    # clothing colour. At 1.0 the input frame is not denoised, which gives every
+    # motion segment an exact visual identity anchor.
     inplace_strength = max(
         MOTION_IDENTITY_MIN_STRENGTH,
         min(1.0, inplace_strength),
@@ -1261,6 +1262,15 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "ckpt_name":    "ltx-2.3-22b-dev-fp8.safetensors",
             "device": "default",
         }},
+        # Give the prompt generator the same image-aware Gemma setup used by
+        # the proven I2V path. This converts the visual identity into explicit
+        # text (including gender presentation, hair, body, and clothing) so it
+        # remains available after the first conditioned frame.
+        "272": {"class_type": "LoraLoader", "inputs": {
+            "model": ["236", 0], "clip": ["243", 0],
+            "lora_name": "gemma-3-12b-it-abliterated_lora_rank64_bf16.safetensors",
+            "strength_model": 1.0, "strength_clip": 1.0,
+        }},
         # Distilled LoRA (matches base workflow).
         "232": {"class_type": "LoraLoaderModelOnly", "inputs": {
             "model": ["236", 0],
@@ -1284,11 +1294,16 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         }},
 
         # ─── Prompts ───────────────────────────────────────────────
-        # Skipping Gemma TextGenerateLTX2Prompt — IC-LoRA pose driving
-        # works best when the prompt is a literal description and the
-        # control signal does the heavy lifting on motion.
+        "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
+            "max_length": 256, "sampling_mode": "on",
+            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+            "sampling_mode.repetition_penalty": 1.05,
+            "sampling_mode.seed": seed,
+        }},
         "240": {"class_type": "CLIPTextEncode", "inputs": {
-            "clip": ["243", 0], "text": prompt or "the subject performs the motion",
+            "clip": ["243", 0], "text": ["274", 0],
         }},
         "247": {"class_type": "CLIPTextEncode", "inputs": {
             "clip": ["243", 0], "text": negative_prompt,
@@ -1305,6 +1320,12 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "resize_type.width": width, "resize_type.height": height,
             "resize_type.crop": "center", "scale_method": "lanczos",
         }},
+        # LTX's official I2V workflow preprocesses character pixels before VAE
+        # encoding. Skipping this left the IC-LoRA with an out-of-distribution
+        # identity anchor and caused immediate person replacement.
+        "324": {"class_type": "LTXVPreprocess", "inputs": {
+            "image": ["238", 0], "img_compression": 18,
+        }},
         "228": {"class_type": "EmptyLTXVLatentVideo", "inputs": {
             "width": width, "height": height, "length": length, "batch_size": 1,
         }},
@@ -1314,7 +1335,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # want identity locked).
         "325": {"class_type": "LTXVImgToVideoConditionOnly", "inputs": {
             "vae": ["236", 2],
-            "image": ["238", 0],
+            "image": ["324", 0],
             "latent": ["228", 0],
             "strength": inplace_strength,
             "bypass": False,

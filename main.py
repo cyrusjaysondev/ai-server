@@ -66,7 +66,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.2"
+API_VERSION = "2.3.3"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1873,7 +1873,7 @@ async def ltx_motion_control(
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Accepted for API compatibility; currently ignored by the IC-LoRA motion workflow."),
-    inplace_strength: float = Form(MOTION_IDENTITY_MIN_STRENGTH, ge=0.0, le=1.0, description="Character-image identity anchor. Motion control enforces a 0.9 minimum so the uploaded person's identity, apparent gender, body, and clothing are not replaced by the reference performer."),
+    inplace_strength: float = Form(MOTION_IDENTITY_MIN_STRENGTH, ge=0.0, le=1.0, description="Character-image identity anchor. Motion control enforces an exact 1.0 lock and derives an image-aware appearance prompt so the uploaded person's identity, apparent gender, body, and clothing are not replaced."),
     motion_strength: float = Form(1.0, ge=0.0, le=1.0, description="DWPose IC-LoRA guide strength. 1.0 follows the reference motion most closely."),
     watermark: str | None = Form(None, description="Optional text overlay at bottom-right. Stripped by Supabase proxies in prod."),
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),

@@ -42,15 +42,22 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertEqual(workflow["331"]["inputs"]["latent"], ["215", 0])
         self.assertEqual(workflow["251"]["inputs"]["samples"], ["331", 2])
         self.assertEqual(workflow["269"]["inputs"]["image"], "character.png")
+        self.assertEqual(workflow["324"]["class_type"], "LTXVPreprocess")
+        self.assertEqual(workflow["324"]["inputs"]["image"], ["238", 0])
+        self.assertEqual(workflow["325"]["inputs"]["image"], ["324", 0])
         self.assertEqual(
             workflow["325"]["inputs"]["strength"],
             MOTION_IDENTITY_MIN_STRENGTH,
         )
         self.assertEqual(workflow["330"]["inputs"]["strength"], 1.0)
-        self.assertIn("IDENTITY LOCK", workflow["240"]["inputs"]["text"])
+        self.assertEqual(workflow["272"]["class_type"], "LoraLoader")
+        self.assertEqual(workflow["274"]["class_type"], "TextGenerateLTX2Prompt")
+        self.assertEqual(workflow["274"]["inputs"]["image"], ["269", 0])
+        self.assertEqual(workflow["240"]["inputs"]["text"], ["274", 0])
+        self.assertIn("IDENTITY LOCK", workflow["274"]["inputs"]["prompt"])
         self.assertIn(
             "reference video supplies pose, timing, and motion only",
-            workflow["240"]["inputs"]["text"],
+            workflow["274"]["inputs"]["prompt"],
         )
         self.assertIn("gender change", workflow["247"]["inputs"]["text"])
         self.assertIn("reference performer appearance", workflow["247"]["inputs"]["text"])
