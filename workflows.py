@@ -1508,17 +1508,6 @@ def build_ltx_motion_workflow(reference_video_filename: str,
                 "resize_type.crop": "center",
                 "scale_method": "lanczos",
             }},
-            "338": {"class_type": "ResizeImageMaskNode", "inputs": {
-                "input": ["269", 0],
-                "resize_type": "scale dimensions",
-                "resize_type.width": width,
-                "resize_type.height": height,
-                "resize_type.crop": "center",
-                "scale_method": "lanczos",
-            }},
-            "339": {"class_type": "LTXVPreprocess", "inputs": {
-                "image": ["338", 0], "img_compression": 18,
-            }},
             "350": {"class_type": "LatentUpscaleModelLoader", "inputs": {
                 "model_name": "ltx-2.3-spatial-upscaler-x2-1.0.safetensors",
             }},
@@ -1527,18 +1516,14 @@ def build_ltx_motion_workflow(reference_video_filename: str,
                 "upscale_model": ["350", 0],
                 "vae": ["236", 2],
             }},
-            "352": {"class_type": "LTXVImgToVideoConditionOnly", "inputs": {
-                "vae": ["236", 2],
-                "image": ["339", 0],
-                "latent": ["351", 0],
-                "strength": inplace_strength,
-                "bypass": False,
-            }},
             "360": {"class_type": "LTXAddVideoICLoRAGuide", "inputs": {
                 "positive": ["331", 0],
                 "negative": ["331", 1],
                 "vae": ["236", 2],
-                "latent": ["352", 0],
+                # The upscaled stage-1 latent already contains the exact
+                # character anchor. Re-applying the still image here caused a
+                # visible double exposure while the pose moved away from frame 0.
+                "latent": ["351", 0],
                 "image": ["322", 0],
                 "frame_idx": 0,
                 "strength": motion_strength,

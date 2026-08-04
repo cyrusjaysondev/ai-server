@@ -601,8 +601,9 @@ decode, so IC-LoRA padding is not exposed as noisy frames. No percentage-based
 post-generation trim is applied. Status polling reports overall segment-aware
 progress and a whole-job ETA; a full 15-second render on the current 22B GPU
 typically takes about 8–12 minutes, while shorter templates complete sooner.
-Quality mode also disables reference facial landmarks, raises DWPose hand/body
-tracking resolution, and re-applies the character identity at full resolution.
+Quality mode also disables reference facial landmarks and raises DWPose
+hand/body tracking resolution. The learned upscaled latent carries the original
+character identity into the refinement pass without a conflicting second anchor.
 
 ### Submit, poll, and download
 
