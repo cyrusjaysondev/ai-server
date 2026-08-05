@@ -1,6 +1,7 @@
 import asyncio
 import re
 import subprocess
+import time
 import uuid, httpx, os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -3334,7 +3335,9 @@ async def admin_refresh_api_code(authorization: str = Header(default=None)):
         "logo_safety.py",
         "watermark.py",
     ):
-        url = f"{api_repo}/{filename}"
+        # Avoid a stale raw-GitHub edge response rolling a pod back to the
+        # prior commit immediately after /admin/refresh-api-code is called.
+        url = f"{api_repo}/{filename}?cb={time.time_ns()}"
         target = api_dir / filename
         tmp = api_dir / f"{filename}.new"
         try:

@@ -168,6 +168,12 @@ class MotionControlWorkflowTests(unittest.TestCase):
             "ltx-2.3-22b-ic-lora-union-control-ref0.5.safetensors",
             setup,
         )
+        self.assertIn('?cb=${cache_bust}', setup)
+
+    def test_admin_api_refresh_bypasses_stale_raw_github_cache(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertIn('?cb={time.time_ns()}', main_source)
 
 
 if __name__ == "__main__":

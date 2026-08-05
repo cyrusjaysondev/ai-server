@@ -807,7 +807,11 @@ $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | 
 fetch_api_code() {
   log "Fetching latest API code..."
   for f in main.py workflows.py face_targeting.py image_output.py safety.py logo_safety.py watermark.py; do
-    wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f"
+    # Raw GitHub responses can remain stale at an edge cache immediately
+    # after a deploy. A unique query keeps an API restart from silently
+    # restoring the previous commit.
+    cache_bust="$(date +%s%N)"
+    wget -q -O "/workspace/api/$f.new" "${API_REPO}/$f?cb=${cache_bust}"
     if [ -s "/workspace/api/$f.new" ]; then
       mv "/workspace/api/$f.new" "/workspace/api/$f"
     else
