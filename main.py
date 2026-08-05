@@ -368,6 +368,8 @@ async def _wait_for_comfy_prompt(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout_seconds
     started_monotonic = loop.time()
+    last_poll_error: str | None = None
+    consecutive_poll_errors = 0
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         while loop.time() < deadline:
@@ -428,16 +430,36 @@ async def _wait_for_comfy_prompt(
                     "eta_seconds": eta_seconds,
                 }
 
-            response = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
-            response.raise_for_status()
+            try:
+                response = await client.get(f"{COMFYUI_URL}/history/{prompt_id}")
+                response.raise_for_status()
+            except httpx.RequestError as exc:
+                # ComfyUI can stop serving HTTP for longer than the client's
+                # per-request timeout while its VAE decoder is saturating the
+                # GPU/CPU. The render itself continues and later appears in
+                # /history. Treating this transient ReadTimeout as a terminal
+                # failure loses a perfectly valid MP4 and refunds the request
+                # even though ComfyUI is still working.
+                consecutive_poll_errors += 1
+                last_poll_error = f"{type(exc).__name__}: {exc}"
+                if consecutive_poll_errors == 1 or consecutive_poll_errors % 10 == 0:
+                    print(
+                        f"[{job_id or prompt_id}] transient ComfyUI history poll "
+                        f"failure #{consecutive_poll_errors}: {last_poll_error}"
+                    )
+                await asyncio.sleep(min(2.0, 0.5 * consecutive_poll_errors))
+                continue
+
+            consecutive_poll_errors = 0
             job_data = response.json().get(prompt_id, {})
             status = job_data.get("status", {})
             if status.get("completed") or status.get("status_str") in {"success", "error"}:
                 return job_data
             await asyncio.sleep(0.5)
 
+    detail = f"; last poll error: {last_poll_error}" if last_poll_error else ""
     raise TimeoutError(
-        f"ComfyUI prompt {prompt_id} did not finish within {timeout_seconds} seconds"
+        f"ComfyUI prompt {prompt_id} did not finish within {timeout_seconds} seconds{detail}"
     )
 
 

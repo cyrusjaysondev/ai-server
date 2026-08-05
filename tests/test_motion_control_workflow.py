@@ -150,6 +150,14 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertIn("Segment {segment} of {total_segments}", main_source)
         self.assertIn("overall_fraction", main_source)
 
+    def test_comfy_history_poll_tolerates_decoder_timeouts(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertIn("except httpx.RequestError as exc", main_source)
+        self.assertIn("transient ComfyUI history poll", main_source)
+        self.assertIn("consecutive_poll_errors = 0", main_source)
+        self.assertIn("continue", main_source)
+
     def test_setup_provisions_every_live_dependency(self):
         setup = (REPO_ROOT / "setup.sh").read_text()
 
