@@ -70,7 +70,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.6"
+API_VERSION = "2.3.7"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1372,6 +1372,10 @@ async def run_motion_control_job(
             INPUT_DIR / character_image_filename,
             final_path,
         )
+        jobs[job_id] = {
+            **jobs.get(job_id, {}),
+            "identity_quality": identity_quality,
+        }
         if not identity_quality.get("passed"):
             reason = identity_quality.get("reason") or "identity drift detected"
             raise RuntimeError(
@@ -2431,6 +2435,7 @@ async def ltx_motion_control(
         "fps": MOTION_FPS,
         "segments": len(chunk_specs),
         "preset": preset,
+        "seed": seed,
         "audio_source": "reference" if audio else "none",
         "identity_lock": {
             "enabled": True,

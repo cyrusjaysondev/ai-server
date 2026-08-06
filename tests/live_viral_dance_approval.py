@@ -61,6 +61,10 @@ def submit_job(
     source_image: Path,
     reference_video: Path,
     prompt: str,
+    *,
+    duration_seconds: float,
+    motion_strength: float,
+    seed: int,
 ) -> dict[str, Any]:
     command = [
         "curl", "-fsS", "--max-time", "180", "-X", "POST", f"{base_url}/ltx/motion",
@@ -74,12 +78,13 @@ def submit_job(
         "-F", "length=121",
         "-F", "fps=24",
         "-F", "match_reference_duration=false",
-        "-F", "max_duration_seconds=4",
+        "-F", f"max_duration_seconds={duration_seconds}",
         "-F", "auto_select_motion_window=true",
         "-F", "audio=false",
         "-F", "enhance_prompt=true",
         "-F", "inplace_strength=1",
-        "-F", "motion_strength=1",
+        "-F", f"motion_strength={motion_strength}",
+        "-F", f"seed={seed}",
         "-F", "require_full_body=true",
         "-F", "require_detectable_face=false",
     ]
@@ -89,8 +94,18 @@ def submit_job(
 
 def poll_job(poll_url: str) -> dict[str, Any]:
     last_marker: tuple[Any, Any, Any] | None = None
+    transient_errors = 0
     while True:
-        status = fetch_json(poll_url, timeout=30.0)
+        try:
+            status = fetch_json(poll_url, timeout=45.0)
+            transient_errors = 0
+        except (TimeoutError, urllib.error.URLError) as error:
+            transient_errors += 1
+            if transient_errors > 12:
+                raise
+            print(f"  transient poll error ({transient_errors}/12): {error}", flush=True)
+            time.sleep(8)
+            continue
         marker = (status.get("stage"), status.get("progress"), status.get("segment"))
         if marker != last_marker:
             print(
@@ -143,7 +158,11 @@ def create_contact_sheet(video: Path, output: Path) -> None:
     )
 
 
-def approval_result(final: dict[str, Any], motion: dict[str, float | int]) -> tuple[bool, list[str]]:
+def approval_result(
+    final: dict[str, Any],
+    motion: dict[str, float | int],
+    expected_duration_seconds: float,
+) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     identity = final.get("identity_quality") or {}
     if not identity.get("passed"):
@@ -152,7 +171,8 @@ def approval_result(final: dict[str, Any], motion: dict[str, float | int]) -> tu
         reasons.append("motion is too weak or nearly static")
     if float(motion.get("moving_frame_fraction", 0.0)) < 0.7:
         reasons.append("motion is not sustained across the clip")
-    if float(final.get("media_duration_seconds") or 0.0) < 3.5:
+    minimum_duration = max(1.0, expected_duration_seconds - 0.25)
+    if float(final.get("media_duration_seconds") or 0.0) < minimum_duration:
         reasons.append("output is shorter than the approved action window")
     return not reasons, reasons
 
@@ -164,6 +184,11 @@ def main() -> int:
     parser.add_argument("--templates", type=Path, required=True)
     parser.add_argument("--profiles", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--duration-seconds", type=float, default=4.0)
+    parser.add_argument("--motion-strength", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=-1)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     base_url = args.base_url.rstrip("/")
@@ -184,21 +209,45 @@ def main() -> int:
     if missing:
         raise SystemExit(f"canonical template export is missing: {', '.join(missing)}")
 
-    for index, (template_key, profile) in enumerate(profiles.items(), start=1):
+    requested = {
+        item.strip()
+        for value in args.only
+        for item in value.split(",")
+        if item.strip()
+    }
+    selected_profiles = [
+        (template_key, profile)
+        for template_key, profile in profiles.items()
+        if not requested or template_key in requested
+    ]
+    unknown = sorted(requested - set(profiles))
+    if unknown:
+        raise SystemExit(f"unknown profile key(s): {', '.join(unknown)}")
+
+    total = len(selected_profiles)
+    for index, (template_key, profile) in enumerate(selected_profiles, start=1):
         existing = report.get(template_key)
-        if existing and existing.get("status") == "completed":
-            print(f"[{index:02d}/15] skip completed {profile['name']}", flush=True)
+        if existing and not args.force:
+            print(f"[{index:02d}/{total:02d}] skip existing {profile['name']}", flush=True)
             continue
 
         template = canonical_templates[template_key]
-        print(f"[{index:02d}/15] {profile['name']} ({template_key})", flush=True)
+        print(f"[{index:02d}/{total:02d}] {profile['name']} ({template_key})", flush=True)
         reference_path = references_dir / f"{template_key}.mp4"
         if not reference_path.exists():
             download(template["sample_video_url"], reference_path)
 
         try:
             wait_for_video_capacity(base_url)
-            submission = submit_job(base_url, args.source_image, reference_path, profile["motionPrompt"])
+            submission = submit_job(
+                base_url,
+                args.source_image,
+                reference_path,
+                profile["motionPrompt"],
+                duration_seconds=args.duration_seconds,
+                motion_strength=args.motion_strength,
+                seed=args.seed,
+            )
             print(
                 f"  submitted {submission.get('job_id')} "
                 f"window={submission.get('reference_start_seconds')}s "
@@ -222,7 +271,7 @@ def main() -> int:
                 download(final["url"], video_path)
                 motion = measure_motion(video_path)
                 create_contact_sheet(video_path, sheets_dir / f"{template_key}.jpg")
-                approved, reasons = approval_result(final, motion)
+                approved, reasons = approval_result(final, motion, args.duration_seconds)
                 item_report.update({"motion_quality": motion, "automatic_approval": approved, "review_reasons": reasons})
                 print(
                     f"  {'AUTO-PASS' if approved else 'REVIEW'} "
@@ -246,8 +295,8 @@ def main() -> int:
         write_json(report_path, report)
 
     passed = sum(bool(item.get("automatic_approval")) for item in report.values())
-    print(f"COMPLETE automatic_pass={passed}/15 report={report_path}", flush=True)
-    return 0 if len(report) == 15 else 1
+    print(f"COMPLETE automatic_pass={passed}/{len(report)} report={report_path}", flush=True)
+    return 0 if all(key in report for key, _ in selected_profiles) else 1
 
 
 if __name__ == "__main__":
