@@ -70,7 +70,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.5"
+API_VERSION = "2.3.6"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -2140,7 +2140,7 @@ async def ltx_text_to_video(
 @app.post("/ltx/motion")
 async def ltx_motion_control(
     background_tasks: BackgroundTasks,
-    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. The output matches its duration up to 15 seconds by default."),
+    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. The identity-safe default selects one active four-second window; callers can explicitly opt into longer segmented renders."),
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
     prompt: str = Form("", description="Free-form action description. The server combines it with an image-aware description of the uploaded character so visible identity traits persist through motion."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
@@ -2150,10 +2150,10 @@ async def ltx_motion_control(
     height: int = Form(960, description="Only used when aspect_ratio=original."),
     length: int = Form(121, description="Fallback frame count when match_reference_duration=false. It is snapped to LTX's required 8n+1 format."),
     fps: int = Form(24, description="Accepted for API compatibility. Motion control renders at 30 fps."),
-    match_reference_duration: bool = Form(True, description="Match the output to the uploaded motion video's duration. Enabled by default so template videos are not cut to five seconds."),
-    max_duration_seconds: float = Form(MOTION_MAX_DURATION_SECONDS, ge=1.0, le=MOTION_MAX_DURATION_SECONDS, description="Maximum source duration to render. The production limit is 15 seconds."),
+    match_reference_duration: bool = Form(False, description="Opt into matching the uploaded motion video's duration. The identity-safe default is one active four-second window so template renders do not cross identity-drifting segment boundaries."),
+    max_duration_seconds: float = Form(4.0, ge=1.0, le=MOTION_MAX_DURATION_SECONDS, description="Maximum source duration to render. Defaults to four identity-safe seconds; explicit long renders may use up to 15 seconds."),
     reference_start_seconds: float = Form(0.0, ge=0.0, le=MOTION_MAX_DURATION_SECONDS, description="Optional source offset before motion extraction."),
-    auto_select_motion_window: bool = Form(False, description="Find the first sustained active section of the reference clip. Viral Dance templates enable this with a single four-second identity-safe render."),
+    auto_select_motion_window: bool = Form(True, description="Find the first sustained active section of the reference clip. Enabled by default to skip quiet or mismatched opening poses."),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Accepted for API compatibility. Image-aware identity enhancement is always enabled for motion control to prevent subject replacement."),

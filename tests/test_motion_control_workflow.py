@@ -200,6 +200,13 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertIn("Segment {segment} of {total_segments}", main_source)
         self.assertIn("overall_fraction", main_source)
 
+    def test_motion_route_uses_identity_safe_defaults(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertIn("match_reference_duration: bool = Form(False", main_source)
+        self.assertIn("max_duration_seconds: float = Form(4.0", main_source)
+        self.assertIn("auto_select_motion_window: bool = Form(True", main_source)
+
     def test_comfy_history_poll_tolerates_decoder_timeouts(self):
         main_source = (REPO_ROOT / "main.py").read_text()
 

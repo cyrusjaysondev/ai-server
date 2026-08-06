@@ -583,8 +583,8 @@ skin tone, and clothing.
 | `height` | int | `960` | Used with `aspect_ratio=original`; otherwise the ratio determines it |
 | `length` | int | `121` | Fallback frame budget used only when `match_reference_duration=false` |
 | `fps` | int | `24` | Accepted for compatibility; motion processing and output use 30 fps |
-| `match_reference_duration` | bool | `true` | Match the output to the reference duration instead of forcing a five-second result |
-| `max_duration_seconds` | float | `15` | Maximum reference duration to render (1–15 seconds) |
+| `match_reference_duration` | bool | `false` | Opt into matching the full reference duration. The default keeps one identity-safe action window. |
+| `max_duration_seconds` | float | `4` | Maximum reference duration to render (1–15 seconds). Four seconds avoids cross-segment identity drift by default. |
 | `seed` | int | `-1` | Random when `-1`; set a value for repeatability |
 | `audio` | bool | `false` | Mux the reference video's original audio onto the result |
 | `enhance_prompt` | bool | `true` | Accepted for compatibility; image-aware identity enhancement is always enabled for motion control |
@@ -592,13 +592,14 @@ skin tone, and clothing.
 | `motion_strength` | float | `1.0` | DWPose motion-guide strength (0–1) |
 | `require_full_body` | bool | `true` | Reject cropped or seated character photos unless DWPose sees a complete standing person with both knees and both feet. Prevents the model from inventing a body and changing the face or facial hair during the opening. |
 | `reference_start_seconds` | float | `0.0` | Optional source-video offset before pose extraction. |
-| `auto_select_motion_window` | bool | `false` | Select the first sustained active section of the reference. Viral Dance enables this with `match_reference_duration=false` and `max_duration_seconds=4` to avoid quiet intros and cross-segment identity drift. |
+| `auto_select_motion_window` | bool | `true` | Select the first sustained active section of the reference to avoid quiet intros and mismatched opening poses. |
 | `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
 | `require_detectable_face` | bool | `false` | Require a detectable face in the character image |
 
-The endpoint follows the reference duration up to 15 seconds. It generates
-long references in GPU-safe four-second segments, shares the boundary frame
-between adjacent segments, and joins them into one continuous result. After
+The identity-safe default selects and renders one active four-second reference
+window. Callers can opt into following the full reference duration up to 15
+seconds. Long references generate in GPU-safe four-second segments, share the boundary frame
+between adjacent segments, and join into one continuous result. After
 every sample, the server runs the required `LTXVCropGuides` node before VAE
 decode, so IC-LoRA padding is not exposed as noisy frames. No percentage-based
 post-generation trim is applied. Status polling reports overall segment-aware
@@ -620,8 +621,9 @@ RESPONSE=$(curl -sS -X POST "$POD/ltx/motion" \
   -F "aspect_ratio=9:16" \
   -F "width=544" \
   -F "height=960" \
-  -F "match_reference_duration=true" \
-  -F "max_duration_seconds=15" \
+  -F "match_reference_duration=false" \
+  -F "max_duration_seconds=4" \
+  -F "auto_select_motion_window=true" \
   -F "preset=fast" \
   -F "audio=true" \
   -F "inplace_strength=1.0" \
