@@ -79,6 +79,29 @@ class LiveViralDanceApprovalTests(unittest.TestCase):
             parser.parse_args(required + ["--no-auto-select-motion-window"]).auto_select_motion_window
         )
 
+    def test_direct_live_submission_uses_the_hidden_identity_guardrails(self):
+        completed = mock.Mock(stdout=json.dumps({"job_id": "job-1"}))
+        with mock.patch.object(HARNESS.subprocess, "run", return_value=completed) as run:
+            HARNESS.submit_job(
+                "http://persistent-pod.test",
+                Path("source.jpg"),
+                Path("reference.mp4"),
+                "Controlled dance prompt",
+                duration_seconds=3,
+                motion_strength=0.6,
+                seed=42,
+                reference_start_seconds=0,
+                auto_select_motion_window=False,
+            )
+
+        command = run.call_args.args[0]
+        negative_field = next(
+            value for value in command if value.startswith("negative_prompt=")
+        )
+        self.assertIn("beard loss", negative_field)
+        self.assertIn("eye shape change", negative_field)
+        self.assertIn("malformed hands", negative_field)
+
     def test_approval_uses_effective_profile_duration(self):
         final = {
             "identity_quality": {"passed": True},

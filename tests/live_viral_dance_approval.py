@@ -25,6 +25,40 @@ PROFILE_SETTING_DEFAULTS: dict[str, float | int | bool] = {
     "auto_select_motion_window": True,
 }
 
+VIRAL_DANCE_IDENTITY_NEGATIVE_PROMPT = ", ".join([
+    "low quality",
+    "worst quality",
+    "deformed",
+    "distorted",
+    "disfigured",
+    "motion smear",
+    "motion artifacts",
+    "bad anatomy",
+    "malformed hands",
+    "mutated fingers",
+    "extra fingers",
+    "missing fingers",
+    "fused fingers",
+    "different person",
+    "identity drift",
+    "face change",
+    "eye shape change",
+    "gaze drift",
+    "asymmetrical eyes",
+    "malformed eyes",
+    "facial hair appearing or disappearing",
+    "beard loss",
+    "beard shortening",
+    "clean-shaven face",
+    "moustache loss",
+    "hands covering face",
+    "face occlusion",
+    "hidden face",
+    "duplicate person",
+    "multiple people",
+    "extra person",
+])
+
 
 def resolve_profile_settings(
     profile: dict[str, Any],
@@ -169,6 +203,7 @@ def submit_job(
         "-F", f"image=@{source_image}",
         "-F", f"reference_video=@{reference_video}",
         "-F", f"prompt={prompt}",
+        "-F", f"negative_prompt={VIRAL_DANCE_IDENTITY_NEGATIVE_PROMPT}",
         "-F", "preset=fast",
         "-F", "aspect_ratio=9:16",
         "-F", "width=544",
