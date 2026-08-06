@@ -15,6 +15,8 @@ from motion_reference import (
     MotionReferenceDownloadError,
     MotionReferenceTooLargeError,
     MotionReferenceValidationError,
+    assess_generated_motion,
+    assess_motion_identity,
     download_motion_reference,
     motion_reference_extension,
 )
@@ -78,7 +80,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.8"
+API_VERSION = "2.3.9"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1159,77 +1161,20 @@ def _extract_motion_continuity_frame(video_path: Path, image_path: Path) -> bool
 
 
 def _assess_motion_identity(source_image_path: Path, video_path: Path) -> dict:
-    """Measure ArcFace stability across one frame per second of the result."""
+    """Measure ArcFace stability densely across the complete result."""
 
-    if face_safety is None or not hasattr(face_safety, "get_largest_face_embedding"):
-        return {"available": False, "passed": False, "reason": "identity detector unavailable"}
+    return assess_motion_identity(
+        source_image_path,
+        video_path,
+        face_detector=face_safety,
+        output_dir=OUTPUT_DIR,
+    )
 
-    try:
-        import numpy as np
-        reference = face_safety.get_largest_face_embedding(source_image_path.read_bytes())
-        if reference is None:
-            return {"available": True, "passed": False, "reason": "no source face detected"}
 
-        prefix = f"motion_identity_{uuid.uuid4().hex}"
-        pattern = OUTPUT_DIR / f"{prefix}_%03d.jpg"
-        extracted = subprocess.run(
-            [
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-i", str(video_path),
-                "-vf", "fps=1",
-                "-frames:v", "16",
-                str(pattern),
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-        frame_paths = sorted(OUTPUT_DIR.glob(f"{prefix}_*.jpg"))
-        if extracted.returncode != 0 or not frame_paths:
-            for frame_path in frame_paths:
-                frame_path.unlink(missing_ok=True)
-            return {"available": True, "passed": False, "reason": "could not sample output faces"}
+def _assess_generated_motion(video_path: Path) -> dict:
+    """Fail-closed full-video motion assessment used by motion control."""
 
-        scores: list[float] = []
-        try:
-            for frame_path in frame_paths:
-                embedding = face_safety.get_largest_face_embedding(frame_path.read_bytes())
-                if embedding is not None:
-                    scores.append(float(np.dot(reference, embedding)))
-        finally:
-            for frame_path in frame_paths:
-                frame_path.unlink(missing_ok=True)
-
-        required_detections = max(3, int(len(frame_paths) * 0.7 + 0.999))
-        if len(scores) < required_detections:
-            return {
-                "available": True,
-                "passed": False,
-                "reason": "face was not detectable throughout the clip",
-                "detected_frames": len(scores),
-                "sampled_frames": len(frame_paths),
-            }
-
-        ordered = sorted(scores)
-        middle = len(ordered) // 2
-        median_score = (
-            ordered[middle]
-            if len(ordered) % 2
-            else (ordered[middle - 1] + ordered[middle]) / 2.0
-        )
-        stable_fraction = sum(score >= 0.22 for score in scores) / len(scores)
-        passed = median_score >= 0.30 and stable_fraction >= 0.70
-        return {
-            "available": True,
-            "passed": passed,
-            "median_similarity": round(median_score, 4),
-            "minimum_similarity": round(min(scores), 4),
-            "stable_frame_fraction": round(stable_fraction, 3),
-            "detected_frames": len(scores),
-            "sampled_frames": len(frame_paths),
-            "reason": None if passed else "the generated face changed during the motion",
-        }
-    except Exception as exc:
-        return {"available": False, "passed": False, "reason": str(exc)}
+    return assess_generated_motion(video_path)
 
 
 async def run_motion_control_job(
@@ -1383,12 +1328,27 @@ async def run_motion_control_job(
         jobs[job_id] = {
             **jobs.get(job_id, {}),
             "identity_quality": identity_quality,
+            "stage": "validating_motion",
+            "progress": 97,
+            "progress_message": "Checking motion across the complete video...",
+        }
+
+        motion_quality = await asyncio.to_thread(_assess_generated_motion, final_path)
+        jobs[job_id] = {
+            **jobs.get(job_id, {}),
+            "motion_quality": motion_quality,
         }
         if not identity_quality.get("passed"):
             reason = identity_quality.get("reason") or "identity drift detected"
             raise RuntimeError(
                 "Video did not pass the face-identity quality check: "
                 f"{reason}. Use a clear standing full-body photo with the face visible."
+            )
+        if not motion_quality.get("passed"):
+            reason = motion_quality.get("reason") or "output is nearly static"
+            raise RuntimeError(
+                "Video did not pass the motion quality check: "
+                f"{reason}. Please retry with a clear full-body photo."
             )
 
         media_duration = await asyncio.to_thread(_probe_video_duration_seconds, final_path)
@@ -1412,6 +1372,7 @@ async def run_motion_control_job(
             "progress_message": "Video ready",
             "eta_seconds": 0,
             "identity_quality": identity_quality,
+            "motion_quality": motion_quality,
         }
         if thumbnail is not None:
             completed["thumbnail_url"] = f"{BASE_URL}/image/{thumbnail.name}"

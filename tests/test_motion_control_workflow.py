@@ -207,6 +207,17 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertIn("max_duration_seconds: float = Form(4.0", main_source)
         self.assertIn("auto_select_motion_window: bool = Form(True", main_source)
 
+    def test_motion_route_attaches_quality_metrics_and_fails_closed(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertIn(
+            "motion_quality = await asyncio.to_thread(_assess_generated_motion, final_path)",
+            main_source,
+        )
+        self.assertIn('"motion_quality": motion_quality', main_source)
+        self.assertIn('if not motion_quality.get("passed"):', main_source)
+        self.assertIn("Video did not pass the motion quality check", main_source)
+
     def test_motion_route_accepts_a_server_fetched_template_reference(self):
         main_source = (REPO_ROOT / "main.py").read_text()
 

@@ -17,6 +17,102 @@ from pathlib import Path
 from typing import Any
 
 
+PROFILE_SETTING_DEFAULTS: dict[str, float | int | bool] = {
+    "duration_seconds": 4.0,
+    "motion_strength": 1.0,
+    "seed": -1,
+    "reference_start_seconds": 0.0,
+    "auto_select_motion_window": True,
+}
+
+
+def resolve_profile_settings(
+    profile: dict[str, Any],
+    *,
+    duration_seconds: float | None = None,
+    motion_strength: float | None = None,
+    seed: int | None = None,
+    reference_start_seconds: float | None = None,
+    auto_select_motion_window: bool | None = None,
+) -> dict[str, float | int | bool]:
+    """Resolve production profile values, applying only explicit CLI overrides."""
+
+    def profile_value(key: str, fallback: float | int | bool) -> Any:
+        value = profile.get(key)
+        return fallback if value is None else value
+
+    return {
+        "duration_seconds": float(
+            profile_value("durationSeconds", PROFILE_SETTING_DEFAULTS["duration_seconds"])
+            if duration_seconds is None
+            else duration_seconds
+        ),
+        "motion_strength": float(
+            profile_value("motionStrength", PROFILE_SETTING_DEFAULTS["motion_strength"])
+            if motion_strength is None
+            else motion_strength
+        ),
+        "seed": int(
+            profile_value("seed", PROFILE_SETTING_DEFAULTS["seed"])
+            if seed is None
+            else seed
+        ),
+        "reference_start_seconds": float(
+            profile_value(
+                "referenceStartSeconds",
+                PROFILE_SETTING_DEFAULTS["reference_start_seconds"],
+            )
+            if reference_start_seconds is None
+            else reference_start_seconds
+        ),
+        "auto_select_motion_window": bool(
+            profile_value(
+                "autoSelectMotionWindow",
+                PROFILE_SETTING_DEFAULTS["auto_select_motion_window"],
+            )
+            if auto_select_motion_window is None
+            else auto_select_motion_window
+        ),
+    }
+
+
+def selected_templates_approved(report: dict[str, Any], selected_keys: list[str]) -> bool:
+    """Return true only when every selected template has an automatic pass."""
+
+    return bool(selected_keys) and all(
+        report.get(template_key, {}).get("automatic_approval") is True
+        for template_key in selected_keys
+    )
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base-url", required=True)
+    parser.add_argument("--source-image", type=Path, required=True)
+    parser.add_argument("--templates", type=Path, required=True)
+    parser.add_argument("--profiles", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--only", action="append", default=[])
+    parser.add_argument("--duration-seconds", type=float)
+    parser.add_argument("--motion-strength", type=float)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--reference-start-seconds", type=float)
+    motion_window = parser.add_mutually_exclusive_group()
+    motion_window.add_argument(
+        "--auto-select-motion-window",
+        dest="auto_select_motion_window",
+        action="store_true",
+    )
+    motion_window.add_argument(
+        "--no-auto-select-motion-window",
+        dest="auto_select_motion_window",
+        action="store_false",
+    )
+    parser.set_defaults(auto_select_motion_window=None)
+    parser.add_argument("--force", action="store_true")
+    return parser
+
+
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text())
 
@@ -181,20 +277,7 @@ def approval_result(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--base-url", required=True)
-    parser.add_argument("--source-image", type=Path, required=True)
-    parser.add_argument("--templates", type=Path, required=True)
-    parser.add_argument("--profiles", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--only", action="append", default=[])
-    parser.add_argument("--duration-seconds", type=float, default=4.0)
-    parser.add_argument("--motion-strength", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=-1)
-    parser.add_argument("--reference-start-seconds", type=float, default=0.0)
-    parser.add_argument("--no-auto-select-motion-window", action="store_true")
-    parser.add_argument("--force", action="store_true")
-    args = parser.parse_args()
+    args = build_argument_parser().parse_args()
 
     base_url = args.base_url.rstrip("/")
     output_dir: Path = args.output_dir
@@ -229,6 +312,7 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"unknown profile key(s): {', '.join(unknown)}")
 
+    selected_keys = [template_key for template_key, _ in selected_profiles]
     total = len(selected_profiles)
     for index, (template_key, profile) in enumerate(selected_profiles, start=1):
         existing = report.get(template_key)
@@ -237,6 +321,14 @@ def main() -> int:
             continue
 
         template = canonical_templates[template_key]
+        effective_settings = resolve_profile_settings(
+            profile,
+            duration_seconds=args.duration_seconds,
+            motion_strength=args.motion_strength,
+            seed=args.seed,
+            reference_start_seconds=args.reference_start_seconds,
+            auto_select_motion_window=args.auto_select_motion_window,
+        )
         print(f"[{index:02d}/{total:02d}] {profile['name']} ({template_key})", flush=True)
         reference_path = references_dir / f"{template_key}.mp4"
         if not reference_path.exists():
@@ -249,16 +341,16 @@ def main() -> int:
                 args.source_image,
                 reference_path,
                 profile["motionPrompt"],
-                duration_seconds=args.duration_seconds,
-                motion_strength=args.motion_strength,
-                seed=args.seed,
-                reference_start_seconds=args.reference_start_seconds,
-                auto_select_motion_window=not args.no_auto_select_motion_window,
+                duration_seconds=float(effective_settings["duration_seconds"]),
+                motion_strength=float(effective_settings["motion_strength"]),
+                seed=int(effective_settings["seed"]),
+                reference_start_seconds=float(effective_settings["reference_start_seconds"]),
+                auto_select_motion_window=bool(effective_settings["auto_select_motion_window"]),
             )
             print(
                 f"  submitted {submission.get('job_id')} "
                 f"window={submission.get('reference_start_seconds')}s "
-                f"frames={submission.get('frames')}",
+                f"frames={submission.get('target_frames')}",
                 flush=True,
             )
             poll_url = submission["poll_url"]
@@ -272,13 +364,18 @@ def main() -> int:
                 "submission": submission,
                 "final": final,
                 "status": final.get("status"),
+                "effective_settings": effective_settings,
             }
             if final.get("status") == "completed":
                 video_path = videos_dir / f"{template_key}.mp4"
                 download(final["url"], video_path)
                 motion = measure_motion(video_path)
                 create_contact_sheet(video_path, sheets_dir / f"{template_key}.jpg")
-                approved, reasons = approval_result(final, motion, args.duration_seconds)
+                approved, reasons = approval_result(
+                    final,
+                    motion,
+                    float(effective_settings["duration_seconds"]),
+                )
                 item_report.update({"motion_quality": motion, "automatic_approval": approved, "review_reasons": reasons})
                 print(
                     f"  {'AUTO-PASS' if approved else 'REVIEW'} "
@@ -297,13 +394,17 @@ def main() -> int:
                 "status": "harness_error",
                 "automatic_approval": False,
                 "review_reasons": [str(error)],
+                "effective_settings": effective_settings,
             }
             print(f"  HARNESS ERROR {error}", flush=True)
         write_json(report_path, report)
 
-    passed = sum(bool(item.get("automatic_approval")) for item in report.values())
-    print(f"COMPLETE automatic_pass={passed}/{len(report)} report={report_path}", flush=True)
-    return 0 if all(key in report for key, _ in selected_profiles) else 1
+    passed = sum(
+        report.get(template_key, {}).get("automatic_approval") is True
+        for template_key in selected_keys
+    )
+    print(f"COMPLETE automatic_pass={passed}/{len(selected_keys)} report={report_path}", flush=True)
+    return 0 if selected_templates_approved(report, selected_keys) else 1
 
 
 if __name__ == "__main__":
