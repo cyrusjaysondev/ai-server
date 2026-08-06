@@ -207,6 +207,13 @@ class MotionControlWorkflowTests(unittest.TestCase):
         self.assertIn("max_duration_seconds: float = Form(4.0", main_source)
         self.assertIn("auto_select_motion_window: bool = Form(True", main_source)
 
+    def test_motion_route_accepts_a_server_fetched_template_reference(self):
+        main_source = (REPO_ROOT / "main.py").read_text()
+
+        self.assertIn("reference_video_url: str | None = Form(None", main_source)
+        self.assertIn("download_motion_reference(normalized_reference_url)", main_source)
+        self.assertIn("Supply exactly one of reference_video or reference_video_url", main_source)
+
     def test_comfy_history_poll_tolerates_decoder_timeouts(self):
         main_source = (REPO_ROOT / "main.py").read_text()
 
@@ -226,6 +233,7 @@ class MotionControlWorkflowTests(unittest.TestCase):
             setup,
         )
         self.assertIn('?cb=${cache_bust}', setup)
+        self.assertIn("main.py workflows.py motion_reference.py", setup)
 
     def test_admin_api_refresh_bypasses_stale_raw_github_cache(self):
         main_source = (REPO_ROOT / "main.py").read_text()

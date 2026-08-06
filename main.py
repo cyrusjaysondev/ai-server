@@ -10,6 +10,14 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTa
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
+from motion_reference import (
+    MOTION_REFERENCE_MAX_BYTES,
+    MotionReferenceDownloadError,
+    MotionReferenceTooLargeError,
+    MotionReferenceValidationError,
+    download_motion_reference,
+    motion_reference_extension,
+)
 try:
     from image_output import optimize_image_file
 except ImportError:
@@ -70,7 +78,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.7"
+API_VERSION = "2.3.8"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -2144,7 +2152,8 @@ async def ltx_text_to_video(
 @app.post("/ltx/motion")
 async def ltx_motion_control(
     background_tasks: BackgroundTasks,
-    reference_video: UploadFile = File(..., description="Reference video whose motion the character should mimic. The identity-safe default selects one active four-second window; callers can explicitly opt into longer segmented renders."),
+    reference_video: UploadFile | None = File(None, description="Uploaded reference video whose motion the character should mimic. Supply this or reference_video_url, not both."),
+    reference_video_url: str | None = Form(None, description="Trusted public Supabase template-assets video URL. The pod downloads this server-side to avoid browser QUIC/range failures."),
     image: UploadFile = File(..., description="Character image — identity / appearance source. Same role as /ltx/i2v's image."),
     prompt: str = Form("", description="Free-form action description. The server combines it with an image-aware description of the uploaded character so visible identity traits persist through motion."),
     negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
@@ -2218,24 +2227,53 @@ async def ltx_motion_control(
             Path(img_path).unlink(missing_ok=True)
             raise
 
-    # Reference video — save the raw upload, then ffmpeg-normalize into the
+    # Reference video — save the raw upload (or fetch a trusted template URL),
+    # then ffmpeg-normalize into the
     # canvas / fps / length the workflow expects. The intermediate raw file
     # is dropped after normalize completes; only the normalized clip is fed
     # to ComfyUI. ffmpeg is preinstalled by setup.sh.
-    raw_video_bytes = await reference_video.read()
+    normalized_reference_url = (reference_video_url or "").strip()
+    if (reference_video is None) == (not normalized_reference_url):
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(
+            400,
+            "Supply exactly one of reference_video or reference_video_url.",
+        )
+
+    try:
+        if normalized_reference_url:
+            raw_video_bytes = await download_motion_reference(normalized_reference_url)
+            raw_video_ext = motion_reference_extension(normalized_reference_url).lstrip(".")
+        else:
+            raw_video_bytes = await reference_video.read()  # type: ignore[union-attr]
+            raw_video_ext = (
+                (reference_video.filename or "").lower().rsplit(".", 1)[-1]  # type: ignore[union-attr]
+                or "mp4"
+            )
+    except MotionReferenceValidationError as exc:
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(400, str(exc)) from exc
+    except MotionReferenceTooLargeError as exc:
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(413, str(exc)) from exc
+    except MotionReferenceDownloadError as exc:
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(502, str(exc)) from exc
+
+    if not raw_video_bytes:
+        Path(img_path).unlink(missing_ok=True)
+        raise HTTPException(400, "Reference video is empty.")
     # Defensive cap: anything beyond ~100MB is almost certainly someone
     # uploading a 4K phone clip we can't process inside Supabase's edge-
     # function body limit anyway. Reject early so the pod doesn't churn
     # ffmpeg on it for 60s only to fail downstream.
-    REF_VIDEO_MAX_BYTES = 100 * 1024 * 1024
-    if len(raw_video_bytes) > REF_VIDEO_MAX_BYTES:
+    if len(raw_video_bytes) > MOTION_REFERENCE_MAX_BYTES:
         Path(img_path).unlink(missing_ok=True)
         raise HTTPException(
             413,
             f"reference video too large: {len(raw_video_bytes) // (1024*1024)} MB > 100 MB. "
             f"Trim to 15s or less and downscale to <1080p before upload.",
         )
-    raw_video_ext = (reference_video.filename or "").lower().rsplit(".", 1)[-1] or "mp4"
     raw_video_path = str(INPUT_DIR / f"ltx_motion_ref_raw_{uuid.uuid4().hex}.{raw_video_ext}")
     Path(raw_video_path).write_bytes(raw_video_bytes)
 
