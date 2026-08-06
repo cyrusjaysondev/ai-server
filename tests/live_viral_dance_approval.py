@@ -65,6 +65,8 @@ def submit_job(
     duration_seconds: float,
     motion_strength: float,
     seed: int,
+    reference_start_seconds: float,
+    auto_select_motion_window: bool,
 ) -> dict[str, Any]:
     command = [
         "curl", "-fsS", "--max-time", "180", "-X", "POST", f"{base_url}/ltx/motion",
@@ -79,7 +81,8 @@ def submit_job(
         "-F", "fps=24",
         "-F", "match_reference_duration=false",
         "-F", f"max_duration_seconds={duration_seconds}",
-        "-F", "auto_select_motion_window=true",
+        "-F", f"reference_start_seconds={reference_start_seconds}",
+        "-F", f"auto_select_motion_window={str(auto_select_motion_window).lower()}",
         "-F", "audio=false",
         "-F", "enhance_prompt=true",
         "-F", "inplace_strength=1",
@@ -188,6 +191,8 @@ def main() -> int:
     parser.add_argument("--duration-seconds", type=float, default=4.0)
     parser.add_argument("--motion-strength", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=-1)
+    parser.add_argument("--reference-start-seconds", type=float, default=0.0)
+    parser.add_argument("--no-auto-select-motion-window", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -247,6 +252,8 @@ def main() -> int:
                 duration_seconds=args.duration_seconds,
                 motion_strength=args.motion_strength,
                 seed=args.seed,
+                reference_start_seconds=args.reference_start_seconds,
+                auto_select_motion_window=not args.no_auto_select_motion_window,
             )
             print(
                 f"  submitted {submission.get('job_id')} "
