@@ -554,6 +554,43 @@ def get_largest_face_bbox(image_bytes: bytes):
     )
 
 
+def get_largest_face_embedding(image_bytes: bytes):
+    """Return the largest detected face's normalized ArcFace embedding.
+
+    This shares the exact detector and fallback preprocessing used by the
+    compliance filter, but performs no blocklist lookup. Motion-control uses
+    it after rendering to reject clips whose person drifts away from the
+    uploaded identity.
+    """
+    try:
+        import io
+        import numpy as np
+        from PIL import Image
+        app = _ensure_app()
+        if app is None:
+            return None
+        pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        faces, _, _ = _detect_with_fallbacks(
+            app,
+            pil,
+            np=np,
+            label_for_log="motion-identity",
+        )
+        if not faces:
+            return None
+        face = max(
+            faces,
+            key=lambda item: (
+                (item.bbox[2] - item.bbox[0])
+                * (item.bbox[3] - item.bbox[1])
+            ),
+        )
+        return face.normed_embedding
+    except Exception as e:
+        print(f"[motion-identity] embedding failed: {e}")
+        return None
+
+
 def get_status() -> dict:
     """Return the current filter state WITHOUT rebuilding.
 

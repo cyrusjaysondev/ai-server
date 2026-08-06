@@ -23,6 +23,97 @@ from PIL import Image
 MOTION_FPS = 30
 MOTION_MAX_DURATION_SECONDS = 15.0
 MOTION_CHUNK_FRAMES = 121  # Four seconds at 30 fps, expressed as 8n + 1.
+MOTION_LOWER_BODY_KEYPOINTS = (8, 9, 10, 11, 12, 13)
+MOTION_KNEE_KEYPOINTS = (9, 12)
+MOTION_ANKLE_KEYPOINTS = (10, 13)
+
+
+def motion_pose_is_full_body(openpose_payload: object) -> bool:
+    """Return whether DWPose sees one complete head-to-feet subject."""
+
+    if not isinstance(openpose_payload, list) or not openpose_payload:
+        return False
+    first_frame = openpose_payload[0]
+    if not isinstance(first_frame, dict):
+        return False
+    people = first_frame.get("people")
+    if not isinstance(people, list):
+        return False
+
+    def visible(points: list, index: int) -> bool:
+        offset = index * 3
+        if offset + 2 >= len(points):
+            return False
+        x, y, confidence = points[offset:offset + 3]
+        try:
+            return float(x) > 0 and float(y) > 0 and float(confidence) > 0
+        except (TypeError, ValueError):
+            return False
+
+    for person in people:
+        if not isinstance(person, dict):
+            continue
+        points = person.get("pose_keypoints_2d")
+        if not isinstance(points, list):
+            continue
+        lower_count = sum(visible(points, index) for index in MOTION_LOWER_BODY_KEYPOINTS)
+        if (
+            lower_count >= 5
+            and all(visible(points, index) for index in MOTION_KNEE_KEYPOINTS)
+            and all(visible(points, index) for index in MOTION_ANKLE_KEYPOINTS)
+        ):
+            return True
+    return False
+
+
+def select_motion_start_seconds(
+    samples: Sequence[tuple[float, float]],
+    *,
+    duration_seconds: float,
+    window_seconds: float = 4.0,
+) -> float:
+    """Select the first sustained-motion window after a quiet intro.
+
+    ``samples`` contains ``(timestamp, frame_difference)`` pairs. Starting at
+    the absolute highest-energy point often cuts into the middle of a gesture,
+    so this chooses the first five-sample run whose motion clearly exceeds the
+    opening baseline and includes a short lead-in for a natural first move.
+    """
+
+    duration_seconds = max(0.0, float(duration_seconds))
+    window_seconds = max(1.0, float(window_seconds))
+    latest_start = max(0.0, duration_seconds - window_seconds)
+    if latest_start <= 0 or len(samples) < 5:
+        return 0.0
+
+    baseline_values = [
+        float(value)
+        for timestamp, value in samples
+        if 0.0 <= float(timestamp) <= min(3.0, duration_seconds * 0.3)
+    ]
+    if not baseline_values:
+        baseline_values = [float(value) for _, value in samples[:10]]
+    ordered = sorted(baseline_values)
+    midpoint = len(ordered) // 2
+    baseline = (
+        ordered[midpoint]
+        if len(ordered) % 2
+        else (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+    )
+    threshold = max(3.0, baseline * 1.55)
+
+    for index in range(0, len(samples) - 4):
+        run = samples[index:index + 5]
+        values = [float(value) for _, value in run]
+        active = sum(value >= threshold for value in values)
+        if active >= 3 and sum(values) / len(values) >= threshold * 1.08:
+            detected = max(0.0, float(run[0][0]) - 0.4)
+            # Starting within the first second creates no meaningful trim and
+            # can make an already-active clip feel abruptly cropped.
+            if detected < 1.0:
+                return 0.0
+            return round(min(detected, latest_start), 3)
+    return 0.0
 
 
 def snap_ltx_frame_count(frame_count: int, *, minimum: int = 9) -> int:
@@ -1057,6 +1148,7 @@ def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
                                      character_image_filename: str,
                                      prompt: str, negative_prompt: str,
                                      width: int, height: int, length: int, fps: int, seed: int,
+                                     identity_image_filename: str | None = None,
                                      preset: str = "fast", audio: bool = False,
                                      enhance_prompt: bool = True,
                                      inplace_strength: float = 0.5,
@@ -1077,6 +1169,7 @@ def build_ltx_motion_workflow_no_vhs(reference_frame_filenames: list[str],
     workflow = build_ltx_motion_workflow(
         reference_video_filename="__frame_batch__",
         character_image_filename=character_image_filename,
+        identity_image_filename=identity_image_filename,
         prompt=prompt,
         negative_prompt=negative_prompt,
         width=width,
@@ -1125,6 +1218,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
                               character_image_filename: str,
                               prompt: str, negative_prompt: str,
                               width: int, height: int, length: int, fps: int, seed: int,
+                              identity_image_filename: str | None = None,
                               preset: str = "fast", audio: bool = False,
                               enhance_prompt: bool = True,
                               inplace_strength: float = 1.0,
@@ -1187,6 +1281,8 @@ def build_ltx_motion_workflow(reference_video_filename: str,
       • Image-aware Gemma prompting is always enabled for identity safety.
     """
     _ = audio, enhance_prompt
+    identity_image_filename = identity_image_filename or character_image_filename
+    identity_image_ref = ["269", 0]
     # Clamp strengths into [0,1] — the IC-LoRA guide enforces this and
     # so does LTXVImgToVideoConditionOnly.
     motion_strength = max(0.0, min(1.0, motion_strength))
@@ -1319,7 +1415,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
 
         # ─── Prompts ───────────────────────────────────────────────
         "274": {"class_type": "TextGenerateLTX2Prompt", "inputs": {
-            "clip": ["272", 1], "image": ["269", 0], "prompt": prompt,
+            "clip": ["272", 1], "image": identity_image_ref, "prompt": prompt,
             "max_length": 192, "sampling_mode": "on",
             "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
             "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
@@ -1474,7 +1570,7 @@ def build_ltx_motion_workflow(reference_video_filename: str,
         # the i2v workflow — reduces the warm/saturated drift the fp8
         # VAE roundtrip produces.
         "280": {"class_type": "ColorMatch", "inputs": {
-            "image_ref": ["269", 0],
+            "image_ref": identity_image_ref,
             "image_target": ["251", 0],
             "method": "mkl",
             "strength": 1.0,
@@ -1493,6 +1589,14 @@ def build_ltx_motion_workflow(reference_video_filename: str,
             "save_output": True,
         }},
     }
+
+    if identity_image_filename != character_image_filename:
+        workflow["270"] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": identity_image_filename},
+        }
+        workflow["274"]["inputs"]["image"] = ["270", 0]
+        workflow["280"]["inputs"]["image_ref"] = ["270", 0]
 
     if quality_mode:
         # Two-stage motion quality path. Stage 1 handles the expensive temporal

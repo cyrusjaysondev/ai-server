@@ -590,6 +590,9 @@ skin tone, and clothing.
 | `enhance_prompt` | bool | `true` | Accepted for compatibility; image-aware identity enhancement is always enabled for motion control |
 | `inplace_strength` | float | `1.0` | Character identity-anchor strength. The server enforces an exact `1.0` lock and derives an image-aware appearance prompt to prevent identity and apparent-gender drift. |
 | `motion_strength` | float | `1.0` | DWPose motion-guide strength (0–1) |
+| `require_full_body` | bool | `true` | Reject cropped or seated character photos unless DWPose sees a complete standing person with both knees and both feet. Prevents the model from inventing a body and changing the face or facial hair during the opening. |
+| `reference_start_seconds` | float | `0.0` | Optional source-video offset before pose extraction. |
+| `auto_select_motion_window` | bool | `false` | Select the first sustained active section of the reference. Viral Dance enables this with `match_reference_duration=false` and `max_duration_seconds=4` to avoid quiet intros and cross-segment identity drift. |
 | `face_filter` | bool | `true` | Reject a character image matching a blocked identity |
 | `require_detectable_face` | bool | `false` | Require a detectable face in the character image |
 

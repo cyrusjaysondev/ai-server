@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -38,8 +39,10 @@ from workflows import (
     duration_to_ltx_frames,
     get_flux_face_swap_workflow,
     ltx_base_nodes,
+    motion_pose_is_full_body,
     normalize_target_face_indices,
     preserve_selected_faces,
+    select_motion_start_seconds,
     snap_ltx_frame_count,
     split_ltx_frame_count,
 )
@@ -67,7 +70,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.4"
+API_VERSION = "2.3.5"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -294,7 +297,11 @@ def _mux_background_music(video_path: Path, music_path: Path) -> tuple[bool, str
     return True, f"music muxed ({dur:.2f}s)"
 
 
-def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, str]:
+def _mux_reference_audio(
+    video_path: Path,
+    audio_source: Path,
+    start_seconds: float = 0.0,
+) -> tuple[bool, str]:
     """Replace the audio track on `video_path` with the audio from
     `audio_source`. Returns (changed, message). `changed` is True only if
     the file on disk was actually rewritten with audio.
@@ -331,12 +338,17 @@ def _mux_reference_audio(video_path: Path, audio_source: Path) -> tuple[bool, st
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", str(video_path),
-        "-stream_loop", "-1", "-i", str(audio_source),
+        "-stream_loop", "-1",
+    ]
+    if start_seconds > 0:
+        cmd.extend(["-ss", f"{start_seconds:.6f}"])
+    cmd.extend([
+        "-i", str(audio_source),
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
         "-shortest",
         str(tmp_out),
-    ]
+    ])
     try:
         res = subprocess.run(cmd, capture_output=True, timeout=120)
     except Exception as e:
@@ -1040,6 +1052,52 @@ def _probe_video_duration_seconds(video_path: Path) -> float:
     return duration
 
 
+def _detect_reference_motion_start(
+    video_path: Path,
+    *,
+    duration_seconds: float,
+    window_seconds: float = 4.0,
+) -> float:
+    """Find the first sustained active section using low-resolution deltas."""
+
+    analysis = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(video_path),
+            "-vf", (
+                "fps=5,"
+                "scale=64:64:force_original_aspect_ratio=decrease,"
+                "pad=64:64:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "format=gray,tblend=all_mode=difference,signalstats,"
+                "metadata=print:file=-"
+            ),
+            "-an", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if analysis.returncode != 0:
+        raise ValueError((analysis.stderr or "motion analysis failed")[-500:])
+
+    samples: list[tuple[float, float]] = []
+    current_time: float | None = None
+    for line in analysis.stdout.splitlines():
+        time_match = re.search(r"pts_time:([-+0-9.eE]+)", line)
+        if time_match:
+            current_time = float(time_match.group(1))
+            continue
+        value_match = re.search(r"lavfi\.signalstats\.YAVG=([-+0-9.eE]+)", line)
+        if value_match and current_time is not None:
+            samples.append((current_time, float(value_match.group(1))))
+
+    return select_motion_start_seconds(
+        samples,
+        duration_seconds=duration_seconds,
+        window_seconds=window_seconds,
+    )
+
+
 def _concat_motion_chunks(chunk_paths: list[Path], output_path: Path) -> None:
     """Join clean motion chunks while removing duplicated boundary frames."""
     if len(chunk_paths) < 2:
@@ -1092,6 +1150,80 @@ def _extract_motion_continuity_frame(video_path: Path, image_path: Path) -> bool
     return result.returncode == 0 and image_path.exists() and image_path.stat().st_size > 0
 
 
+def _assess_motion_identity(source_image_path: Path, video_path: Path) -> dict:
+    """Measure ArcFace stability across one frame per second of the result."""
+
+    if face_safety is None or not hasattr(face_safety, "get_largest_face_embedding"):
+        return {"available": False, "passed": False, "reason": "identity detector unavailable"}
+
+    try:
+        import numpy as np
+        reference = face_safety.get_largest_face_embedding(source_image_path.read_bytes())
+        if reference is None:
+            return {"available": True, "passed": False, "reason": "no source face detected"}
+
+        prefix = f"motion_identity_{uuid.uuid4().hex}"
+        pattern = OUTPUT_DIR / f"{prefix}_%03d.jpg"
+        extracted = subprocess.run(
+            [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-i", str(video_path),
+                "-vf", "fps=1",
+                "-frames:v", "16",
+                str(pattern),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        frame_paths = sorted(OUTPUT_DIR.glob(f"{prefix}_*.jpg"))
+        if extracted.returncode != 0 or not frame_paths:
+            for frame_path in frame_paths:
+                frame_path.unlink(missing_ok=True)
+            return {"available": True, "passed": False, "reason": "could not sample output faces"}
+
+        scores: list[float] = []
+        try:
+            for frame_path in frame_paths:
+                embedding = face_safety.get_largest_face_embedding(frame_path.read_bytes())
+                if embedding is not None:
+                    scores.append(float(np.dot(reference, embedding)))
+        finally:
+            for frame_path in frame_paths:
+                frame_path.unlink(missing_ok=True)
+
+        required_detections = max(3, int(len(frame_paths) * 0.7 + 0.999))
+        if len(scores) < required_detections:
+            return {
+                "available": True,
+                "passed": False,
+                "reason": "face was not detectable throughout the clip",
+                "detected_frames": len(scores),
+                "sampled_frames": len(frame_paths),
+            }
+
+        ordered = sorted(scores)
+        middle = len(ordered) // 2
+        median_score = (
+            ordered[middle]
+            if len(ordered) % 2
+            else (ordered[middle - 1] + ordered[middle]) / 2.0
+        )
+        stable_fraction = sum(score >= 0.22 for score in scores) / len(scores)
+        passed = median_score >= 0.30 and stable_fraction >= 0.70
+        return {
+            "available": True,
+            "passed": passed,
+            "median_similarity": round(median_score, 4),
+            "minimum_similarity": round(min(scores), 4),
+            "stable_frame_fraction": round(stable_fraction, 3),
+            "detected_frames": len(scores),
+            "sampled_frames": len(frame_paths),
+            "reason": None if passed else "the generated face changed during the motion",
+        }
+    except Exception as exc:
+        return {"available": False, "passed": False, "reason": str(exc)}
+
+
 async def run_motion_control_job(
     job_id: str,
     chunk_specs: list[dict],
@@ -1111,6 +1243,7 @@ async def run_motion_control_job(
     watermark_image: bool,
     reference_duration_seconds: float,
     target_frame_count: int,
+    reference_start_seconds: float,
 ) -> None:
     """Generate GPU-safe motion chunks, preserve continuity, and join them."""
     chunk_outputs: list[Path] = []
@@ -1142,6 +1275,11 @@ async def run_motion_control_job(
             }
             workflow_args = dict(
                 character_image_filename=current_character_filename,
+                # Continuity uses the previous segment's last frame, but Gemma
+                # must keep describing the original upload. Otherwise each
+                # four-second boundary re-describes a progressively altered
+                # face and is exactly where beards and eye shape disappear.
+                identity_image_filename=character_image_filename,
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 width=width,
@@ -1200,7 +1338,10 @@ async def run_motion_control_job(
         audio_warning = None
         if audio_source_path:
             ok, message = await asyncio.to_thread(
-                _mux_reference_audio, final_path, Path(audio_source_path),
+                _mux_reference_audio,
+                final_path,
+                Path(audio_source_path),
+                reference_start_seconds,
             )
             if not ok:
                 audio_warning = message
@@ -1220,6 +1361,24 @@ async def run_motion_control_job(
         if jobs.get(job_id, {}).get("status") == "cancelled":
             raise JobCancelled(job_id)
 
+        jobs[job_id] = {
+            **jobs[job_id],
+            "stage": "validating_identity",
+            "progress": 95,
+            "progress_message": "Checking face and identity consistency...",
+        }
+        identity_quality = await asyncio.to_thread(
+            _assess_motion_identity,
+            INPUT_DIR / character_image_filename,
+            final_path,
+        )
+        if not identity_quality.get("passed"):
+            reason = identity_quality.get("reason") or "identity drift detected"
+            raise RuntimeError(
+                "Video did not pass the face-identity quality check: "
+                f"{reason}. Use a clear standing full-body photo with the face visible."
+            )
+
         media_duration = await asyncio.to_thread(_probe_video_duration_seconds, final_path)
         thumbnail = await asyncio.to_thread(_extract_video_thumbnail, final_path)
         completed_at = datetime.now(timezone.utc)
@@ -1232,6 +1391,7 @@ async def run_motion_control_job(
             "duration_seconds": round((completed_at - started_at).total_seconds(), 1),
             "media_duration_seconds": round(media_duration, 3),
             "reference_duration_seconds": round(reference_duration_seconds, 3),
+            "reference_start_seconds": round(reference_start_seconds, 3),
             "frames": target_frame_count,
             "fps": MOTION_FPS,
             "segments": len(chunk_specs),
@@ -1239,6 +1399,7 @@ async def run_motion_control_job(
             "stage": "completed",
             "progress_message": "Video ready",
             "eta_seconds": 0,
+            "identity_quality": identity_quality,
         }
         if thumbnail is not None:
             completed["thumbnail_url"] = f"{BASE_URL}/image/{thumbnail.name}"
@@ -1756,6 +1917,62 @@ def _require_detectable_face(endpoint: str, enabled: bool,
             })
 
 
+async def _require_motion_full_body_pose(image_filename: str, job_id: str) -> None:
+    """Run a lightweight DWPose preflight and reject cropped dance inputs."""
+
+    workflow = {
+        "1": {"class_type": "LoadImage", "inputs": {"image": image_filename}},
+        "2": {"class_type": "DWPreprocessor", "inputs": {
+            "image": ["1", 0],
+            "detect_hand": "enable",
+            "detect_body": "enable",
+            "detect_face": "enable",
+            "resolution": 768,
+            "bbox_detector": "yolox_l.onnx",
+            "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt",
+            "scale_stick_for_xinsr_cn": "disable",
+        }},
+        # PreviewImage makes the graph an output workflow. The keypoint JSON is
+        # returned in node 2's history payload, so no validation files persist.
+        "3": {"class_type": "PreviewImage", "inputs": {"images": ["2", 0]}},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{COMFYUI_URL}/prompt",
+                json={"prompt": workflow, "client_id": str(uuid.uuid4())},
+            )
+            response.raise_for_status()
+            prompt_id = response.json()["prompt_id"]
+        history = await _wait_for_comfy_prompt(
+            prompt_id,
+            job_id=job_id,
+            timeout_seconds=120,
+        )
+        raw_payloads = history.get("outputs", {}).get("2", {}).get("openpose_json", [])
+        openpose_payload = json.loads(raw_payloads[0]) if raw_payloads else None
+    except JobCancelled:
+        raise
+    except Exception as exc:
+        print(f"[{job_id}] motion full-body preflight unavailable: {exc}")
+        raise HTTPException(503, detail={
+            "error": "server_busy",
+            "error_code": "pose_validation_unavailable",
+            "reason": "The dance-photo quality check is temporarily unavailable. Please try again.",
+        })
+
+    if not motion_pose_is_full_body(openpose_payload):
+        raise HTTPException(422, detail={
+            "error": "image_quality",
+            "error_code": "full_body_required",
+            "reason": (
+                "Viral Dance needs a standing full-body photo with one person, "
+                "both knees, and both feet clearly visible. Chest-up or seated "
+                "photos cause face, beard, body, and opening-frame changes."
+            ),
+        })
+
+
 def _apply_logo_filter(endpoint: str, job_id: str, logo_filter: bool,
                        images_with_names: list) -> None:
     """Parallel to _apply_face_filter but for the logo/flag blocklist (CLIP-based)."""
@@ -1935,6 +2152,8 @@ async def ltx_motion_control(
     fps: int = Form(24, description="Accepted for API compatibility. Motion control renders at 30 fps."),
     match_reference_duration: bool = Form(True, description="Match the output to the uploaded motion video's duration. Enabled by default so template videos are not cut to five seconds."),
     max_duration_seconds: float = Form(MOTION_MAX_DURATION_SECONDS, ge=1.0, le=MOTION_MAX_DURATION_SECONDS, description="Maximum source duration to render. The production limit is 15 seconds."),
+    reference_start_seconds: float = Form(0.0, ge=0.0, le=MOTION_MAX_DURATION_SECONDS, description="Optional source offset before motion extraction."),
+    auto_select_motion_window: bool = Form(False, description="Find the first sustained active section of the reference clip. Viral Dance templates enable this with a single four-second identity-safe render."),
     seed: int = Form(-1),
     audio: bool = Form(False, description="Carry the reference video's original audio track onto the output (Kling-style). If the reference is shorter than the output, audio loops to fill. If the reference has no audio, this is a silent no-op. We do NOT use LTX's audio synthesis path here — the reference audio is muxed via ffmpeg post-generation."),
     enhance_prompt: bool = Form(True, description="Accepted for API compatibility. Image-aware identity enhancement is always enabled for motion control to prevent subject replacement."),
@@ -1944,6 +2163,7 @@ async def ltx_motion_control(
     watermark_image: bool = Form(False, description="Composite the Metfone GenAI logo at the bottom-right."),
     face_filter: bool = Form(True, description="Reject the character image when it matches a blocked face identity. Set false to skip this check."),
     require_detectable_face: bool = Form(False, description="Opt-in input validation. When true, reject the character image unless at least one clear face is detectable. Default false."),
+    require_full_body: bool = Form(True, description="Require a standing head-to-feet character photo for motion transfer. Enabled by default because cropped or seated photos force the model to invent a body and cause face, beard, and opening-frame drift."),
 ):
     """Kling-style motion control via LTX 2.3.
 
@@ -1987,6 +2207,12 @@ async def ltx_motion_control(
     img_filename = f"ltx_motion_img_{uuid.uuid4().hex}.png"
     img_path = str(INPUT_DIR / img_filename)
     Path(img_path).write_bytes(img_bytes)
+    if require_full_body:
+        try:
+            await _require_motion_full_body_pose(img_filename, job_id)
+        except Exception:
+            Path(img_path).unlink(missing_ok=True)
+            raise
 
     # Reference video — save the raw upload, then ffmpeg-normalize into the
     # canvas / fps / length the workflow expects. The intermediate raw file
@@ -2019,9 +2245,31 @@ async def ltx_motion_control(
         Path(img_path).unlink(missing_ok=True)
         raise HTTPException(400, f"could not read reference video duration: {exc}")
 
+    selected_reference_start = min(
+        max(0.0, reference_start_seconds),
+        max(0.0, reference_duration - 1.0),
+    )
+    if auto_select_motion_window:
+        try:
+            selected_reference_start = await asyncio.to_thread(
+                _detect_reference_motion_start,
+                raw_video_file,
+                duration_seconds=reference_duration,
+                window_seconds=max_duration_seconds,
+            )
+        except (ValueError, subprocess.SubprocessError) as exc:
+            # Motion analysis is an optimization, not a reason to reject an
+            # otherwise valid template. Fall back to the explicit offset.
+            print(f"[{job_id}] reference motion-window analysis failed: {exc}")
+
+    available_reference_duration = max(
+        1.0,
+        reference_duration - selected_reference_start,
+    )
+
     if match_reference_duration:
         target_frame_count = duration_to_ltx_frames(
-            reference_duration,
+            available_reference_duration,
             fps=MOTION_FPS,
             max_duration_seconds=max_duration_seconds,
         )
@@ -2060,7 +2308,7 @@ async def ltx_motion_control(
         for index, chunk_length in enumerate(chunk_lengths):
             chunk_filename = f"ltx_motion_ref_{uuid.uuid4().hex}.mp4"
             chunk_path = INPUT_DIR / chunk_filename
-            start_seconds = elapsed_intervals / MOTION_FPS
+            start_seconds = selected_reference_start + elapsed_intervals / MOTION_FPS
             normalize_command = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-stream_loop", "-1",
@@ -2168,6 +2416,7 @@ async def ltx_motion_control(
         watermark_image=watermark_image,
         reference_duration_seconds=reference_duration,
         target_frame_count=target_frame_count,
+        reference_start_seconds=selected_reference_start,
     )
     return {
         "job_id": job_id,
@@ -2176,6 +2425,7 @@ async def ltx_motion_control(
         **_job_links(job_id),
         "workflow_path": "vhs" if use_vhs else "frame-extract",
         "reference_duration_seconds": round(reference_duration, 3),
+        "reference_start_seconds": round(selected_reference_start, 3),
         "target_duration_seconds": round(target_frame_count / MOTION_FPS, 3),
         "target_frames": target_frame_count,
         "fps": MOTION_FPS,
@@ -2185,7 +2435,7 @@ async def ltx_motion_control(
         "identity_lock": {
             "enabled": True,
             "inplace_strength": inplace_strength,
-            "reference_appearance_used": False,
+            "reference_appearance_used": True,
         },
         "note": (
             "Output duration follows the reference video up to 15 seconds. "

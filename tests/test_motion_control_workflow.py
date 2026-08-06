@@ -6,6 +6,8 @@ from workflows import (
     build_ltx_motion_workflow,
     build_ltx_motion_workflow_no_vhs,
     duration_to_ltx_frames,
+    motion_pose_is_full_body,
+    select_motion_start_seconds,
     split_ltx_frame_count,
 )
 
@@ -14,6 +16,54 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class MotionControlWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def _pose_payload(visible_indices):
+        points = [0.0] * (18 * 3)
+        for index in visible_indices:
+            points[index * 3:index * 3 + 3] = [100.0 + index, 200.0 + index, 1.0]
+        return [{"people": [{"pose_keypoints_2d": points}]}]
+
+    def test_full_body_preflight_accepts_both_legs_and_feet(self):
+        payload = self._pose_payload(range(18))
+
+        self.assertTrue(motion_pose_is_full_body(payload))
+
+    def test_full_body_preflight_rejects_cropped_or_seated_photo(self):
+        payload = self._pose_payload([0, 1, 2, 3, 4, 5, 6, 7, 8])
+
+        self.assertFalse(motion_pose_is_full_body(payload))
+
+    def test_motion_window_skips_quiet_intro_with_short_lead_in(self):
+        samples = [(index / 5, 1.5) for index in range(20)]
+        samples.extend((4 + index / 5, 6.0) for index in range(20))
+
+        self.assertEqual(
+            select_motion_start_seconds(
+                samples,
+                duration_seconds=12,
+                window_seconds=4,
+            ),
+            3.2,
+        )
+
+    def test_continuity_frame_keeps_original_identity_reference(self):
+        workflow = build_ltx_motion_workflow(
+            reference_video_filename="dance.mp4",
+            character_image_filename="continuity.png",
+            identity_image_filename="original.png",
+            prompt="dance",
+            negative_prompt="",
+            width=544,
+            height=960,
+            length=121,
+            fps=30,
+            seed=42,
+        )
+
+        self.assertEqual(workflow["269"]["inputs"]["image"], "continuity.png")
+        self.assertEqual(workflow["270"]["inputs"]["image"], "original.png")
+        self.assertEqual(workflow["274"]["inputs"]["image"], ["270", 0])
+
     def test_workflow_contains_required_motion_nodes_and_model(self):
         workflow = build_ltx_motion_workflow(
             reference_video_filename="dance.mp4",
