@@ -40,6 +40,17 @@ else
   fi
 fi
 
+# The network volume keeps the last known-good API supervisor. Always ask it
+# to start after the setup attempt so a temporary/retired setup URL cannot
+# leave port 7860 offline after a pod restart. start_api.sh is flock-guarded,
+# so this is harmless when setup.sh already launched it.
+if [ -x /workspace/start_api.sh ]; then
+  log "launching persistent API supervisor"
+  setsid nohup bash /workspace/start_api.sh </dev/null >>/workspace/api_setup.log 2>&1 8>&- &
+else
+  log "WARN: /workspace/start_api.sh is unavailable; API supervisor not started"
+fi
+
 # Keep the container alive by waiting on /start.sh (ends in `sleep infinity`).
 # Even if setup.sh failed, SSH/Jupyter/ComfyUI remain accessible so you can
 # tail /workspace/api_setup.log and re-run setup.sh manually.
