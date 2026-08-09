@@ -50,8 +50,10 @@ from workflows import (
     duration_to_ltx_frames,
     get_flux_face_swap_workflow,
     ltx_base_nodes,
+    ltx_end_hold_frame_index,
     motion_pose_is_full_body,
     normalize_target_face_indices,
+    preserve_body_head,
     preserve_selected_faces,
     select_motion_start_seconds,
     snap_ltx_frame_count,
@@ -81,7 +83,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.4.0"
+API_VERSION = "2.4.1"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -603,39 +605,19 @@ async def _preserve_body_inplace(image_path, template_path: str, *, job_id: str)
     feathered at the neck/hairline), and overlay it on the template.
 
     Fail-open: any problem keeps the full swap output untouched."""
-    from pathlib import Path as _Path
-    image_path = _Path(image_path)
     try:
-        from PIL import Image, ImageDraw, ImageFilter
         if face_safety is None or not hasattr(face_safety, "get_largest_face_bbox"):
             return False
-        swap = Image.open(image_path).convert("RGB")
-        W, H = swap.size
-        tmpl = Image.open(template_path).convert("RGB")
-        # The swap output is spatially aligned with the (scaled) template — same
-        # composition/pose — so scaling the template to the swap size lines them up.
-        if tmpl.size != (W, H):
-            tmpl = tmpl.resize((W, H), Image.LANCZOS)
-        bbox = face_safety.get_largest_face_bbox(image_path.read_bytes())
-        if not bbox:
-            print(f"[{job_id}] preserve-body: no face detected, keeping full swap")
-            return False
-        x1, y1, x2, y2 = bbox
-        fw, fh = max(1, x2 - x1), max(1, y2 - y1)
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        # Head ellipse: generous so it encloses hair + jaw (and the template's
-        # original head, since they're aligned) — up for hair, down to the neck.
-        hx1, hx2 = cx - fw * 1.25, cx + fw * 1.25
-        hy1, hy2 = cy - fh * 1.65, cy + fh * 1.35
-        mask = Image.new("L", (W, H), 0)
-        ImageDraw.Draw(mask).ellipse([hx1, hy1, hx2, hy2], fill=255)
-        feather = max(8, int(max(fw, fh) * 0.18))
-        mask = mask.filter(ImageFilter.GaussianBlur(feather))
-        out = tmpl.copy()
-        out.paste(swap, (0, 0), mask)
-        out.save(image_path)
-        print(f"[{job_id}] preserve-body: head composited onto template (body/bg from template)")
-        return True
+        preserved, message = preserve_body_head(
+            image_path,
+            template_path,
+            detect_face_bbox=face_safety.get_largest_face_bbox,
+        )
+        if preserved:
+            print(f"[{job_id}] preserve-body: {message}")
+        else:
+            print(f"[{job_id}] preserve-body: {message}, keeping full swap")
+        return preserved
     except Exception as e:
         print(f"[{job_id}] preserve-body failed (keeping full swap): {e}")
         return False
@@ -2068,12 +2050,18 @@ async def ltx_first_last_frame_to_video(
     width: int = Form(544),
     height: int = Form(960),
     length: int = Form(121),
-    fps: int = Form(24),
+    fps: int = Form(24, ge=1, le=60),
     seed: int = Form(-1),
     audio: bool = Form(False),
     enhance_prompt: bool = Form(False, description="Use the first frame to expand a short prompt"),
     start_strength: float = Form(1.0, ge=0.0, le=1.0),
     end_strength: float = Form(1.0, ge=0.0, le=1.0),
+    end_hold_seconds: float = Form(
+        1.0,
+        gt=0.0,
+        le=4.0,
+        description="Seconds to hold the supplied last frame before the video ends",
+    ),
     watermark: str | None = Form(None),
     watermark_image: bool = Form(False),
     caption: str | None = Form(None),
@@ -2154,6 +2142,7 @@ async def ltx_first_last_frame_to_video(
             enhance_prompt=enhance_prompt,
             start_strength=start_strength,
             end_strength=end_strength,
+            end_hold_seconds=end_hold_seconds,
         )
         _reserve_video_job(job_id, cleanup_paths)
     except Exception:
@@ -2176,7 +2165,12 @@ async def ltx_first_last_frame_to_video(
         "job_id": job_id,
         "status": "queued",
         "model": "ltx-2.3-22b-keyframes",
-        "keyframes": [0, -1],
+        "keyframes": [
+            0,
+            ltx_end_hold_frame_index(length, fps, end_hold_seconds),
+            -1,
+        ],
+        "end_hold_seconds": end_hold_seconds,
         **_job_links(job_id),
     }
 

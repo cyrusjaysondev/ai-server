@@ -27,6 +27,16 @@ MOTION_LOWER_BODY_KEYPOINTS = (8, 9, 10, 11, 12, 13)
 MOTION_KNEE_KEYPOINTS = (9, 12)
 MOTION_ANKLE_KEYPOINTS = (10, 13)
 
+# ``preserve_body`` must never let the regenerated face-swap frame bleed into
+# an exposed chest. These ratios keep the full face and hair, then taper the
+# replacement through a short neck band before a hard pixel-preservation
+# cutoff below the detected chin.
+PRESERVE_BODY_HEAD_X_RADIUS = 1.10
+PRESERVE_BODY_HEAD_TOP_RADIUS = 1.45
+PRESERVE_BODY_HEAD_BOTTOM_RADIUS = 0.75
+PRESERVE_BODY_MASK_FEATHER_RATIO = 0.10
+PRESERVE_BODY_NECK_EXTENSION_RATIO = 0.25
+
 
 def motion_pose_is_full_body(openpose_payload: object) -> bool:
     """Return whether DWPose sees one complete head-to-feet subject."""
@@ -259,6 +269,84 @@ def order_face_bboxes(
             reverse=True,
         )
     raise ValueError(f"unsupported face_order '{face_order}'")
+
+
+def preserve_body_head(
+    image_path: str | Path,
+    template_path: str | Path,
+    *,
+    detect_face_bbox: Callable[[bytes], Sequence[int | float] | None],
+) -> tuple[bool, str]:
+    """Composite only the generated head onto exact template body pixels.
+
+    Face-swap generation redraws the complete frame. A broad feathered ellipse
+    previously extended well below the chin and copied regenerated collar and
+    shirt pixels onto exposed skin. The mask now keeps the full face/hair,
+    fades through a short neck band, and is forced to zero at the neck cutoff.
+    Every pixel on and below that cutoff therefore comes from ``template_path``.
+    """
+    from PIL import ImageChops, ImageDraw, ImageFilter
+
+    output_path = Path(image_path)
+    base_path = Path(template_path)
+    generated = Image.open(output_path).convert("RGB")
+    width, height = generated.size
+    template = Image.open(base_path).convert("RGB")
+    if template.size != (width, height):
+        template = template.resize((width, height), Image.Resampling.LANCZOS)
+
+    bbox = detect_face_bbox(output_path.read_bytes())
+    if not bbox or len(bbox) != 4:
+        return False, "no face detected"
+
+    x1, y1, x2, y2 = (int(round(float(value))) for value in bbox)
+    face_width = max(1, x2 - x1)
+    face_height = max(1, y2 - y1)
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+
+    replacement_mask = Image.new("L", (width, height), 0)
+    ImageDraw.Draw(replacement_mask).ellipse(
+        [
+            center_x - face_width * PRESERVE_BODY_HEAD_X_RADIUS,
+            center_y - face_height * PRESERVE_BODY_HEAD_TOP_RADIUS,
+            center_x + face_width * PRESERVE_BODY_HEAD_X_RADIUS,
+            center_y + face_height * PRESERVE_BODY_HEAD_BOTTOM_RADIUS,
+        ],
+        fill=255,
+    )
+    feather = max(
+        4,
+        int(round(max(face_width, face_height) * PRESERVE_BODY_MASK_FEATHER_RATIO)),
+    )
+    replacement_mask = replacement_mask.filter(ImageFilter.GaussianBlur(feather))
+
+    # Keep the face fully opaque through the detected chin, then smoothly fade
+    # to zero. Multiplying after the Gaussian blur guarantees that blur cannot
+    # leak regenerated pixels into the protected chest/body region.
+    chin_y = max(0, min(height, y2))
+    neck_cutoff = max(
+        chin_y + 1,
+        int(round(y2 + face_height * PRESERVE_BODY_NECK_EXTENSION_RATIO)),
+    )
+    neck_cutoff = min(height, neck_cutoff)
+    vertical_limit = Image.new("L", (1, height), 0)
+    vertical_pixels = vertical_limit.load()
+    for y in range(height):
+        if y <= chin_y:
+            alpha = 255
+        elif y < neck_cutoff:
+            alpha = int(round(255 * (neck_cutoff - y) / (neck_cutoff - chin_y)))
+        else:
+            alpha = 0
+        vertical_pixels[0, y] = alpha
+    vertical_limit = vertical_limit.resize((width, height), Image.Resampling.NEAREST)
+    replacement_mask = ImageChops.multiply(replacement_mask, vertical_limit)
+
+    composited = template.copy()
+    composited.paste(generated, (0, 0), replacement_mask)
+    composited.save(output_path)
+    return True, f"head composited; template pixels locked from y={neck_cutoff}"
 
 
 def preserve_selected_faces(
@@ -669,6 +757,28 @@ LTX_PRESETS = {
 }
 
 
+def ltx_end_hold_frame_index(
+    length: int,
+    fps: int,
+    end_hold_seconds: float = 1.0,
+) -> int:
+    """Return the first frame pinned to the final image before frame ``-1``.
+
+    LTX can satisfy a last-frame guide only at the very end while drifting or
+    morphing immediately beforehand. Repeating the final-image guide one second
+    earlier gives the sampler a stable held endpoint. Very short clips clamp the
+    hold start to frame 1 so the first-frame guide at frame 0 remains distinct.
+    """
+    if length < 9 or (length - 1) % 8 != 0:
+        raise ValueError("first/last-frame video length must be 8n+1 and at least 9 frames")
+    if fps < 1:
+        raise ValueError("first/last-frame video fps must be at least 1")
+    if end_hold_seconds <= 0:
+        raise ValueError("end_hold_seconds must be greater than 0")
+    hold_frames = max(1, int(round(float(end_hold_seconds) * fps)))
+    return max(1, (length - 1) - hold_frames)
+
+
 def compute_ltx_dimensions(width: int, height: int, aspect_ratio: str) -> tuple[int, int]:
     """Return (width, height) snapped to multiples of 32. If aspect_ratio given, derive height from width."""
     if aspect_ratio in LTX_ASPECT_RATIOS:
@@ -925,18 +1035,20 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
                              preset: str = "fast", audio: bool = False,
                              enhance_prompt: bool = False,
                              start_strength: float = 1.0,
-                             end_strength: float = 1.0) -> dict:
+                             end_strength: float = 1.0,
+                             end_hold_seconds: float = 1.0) -> dict:
     """Build an LTX 2.3 first/last-frame interpolation workflow.
 
-    ComfyUI's built-in ``LTXVAddGuide`` appends the supplied endpoint
-    images to the latent. The guides must be chained and cropped after
-    sampling. The quality preset crops before upscale, then reapplies both
-    endpoint guides for the refine pass and crops once more before decode.
+    ComfyUI's built-in ``LTXVAddGuide`` appends the supplied endpoint images
+    to the latent. The guides must be chained and cropped after sampling. The
+    final image is pinned both at the start of a one-second end hold and again
+    at frame ``-1`` so the model cannot morph immediately before the endpoint.
+    The quality preset crops before upscale, then reapplies all three guides
+    for the refine pass and crops once more before decode.
     """
     if preset not in LTX_PRESETS:
         raise ValueError(f"invalid LTX preset: {preset}")
-    if length < 9 or (length - 1) % 8 != 0:
-        raise ValueError("first/last-frame video length must be 8n+1 and at least 9 frames")
+    end_hold_frame = ltx_end_hold_frame_index(length, fps, end_hold_seconds)
 
     two_pass = LTX_PRESETS[preset]["two_pass"]
     low_width = max(32, (width // 2 // 32) * 32) if two_pass else width
@@ -968,10 +1080,16 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
             "latent": ["228", 0], "image": ["354", 0],
             "frame_idx": 0, "strength": start_strength,
         }},
-        "361": {"class_type": "LTXVAddGuide", "inputs": {
+        "365": {"class_type": "LTXVAddGuide", "inputs": {
             **guide_defaults,
             "positive": ["360", 0], "negative": ["360", 1],
             "latent": ["360", 2], "image": ["355", 0],
+            "frame_idx": end_hold_frame, "strength": end_strength,
+        }},
+        "361": {"class_type": "LTXVAddGuide", "inputs": {
+            **guide_defaults,
+            "positive": ["365", 0], "negative": ["365", 1],
+            "latent": ["365", 2], "image": ["355", 0],
             "frame_idx": -1, "strength": end_strength,
         }},
     }
@@ -1001,10 +1119,16 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
                 "latent": ["253", 0], "image": ["358", 0],
                 "frame_idx": 0, "strength": start_strength,
             }},
-            "363": {"class_type": "LTXVAddGuide", "inputs": {
+            "366": {"class_type": "LTXVAddGuide", "inputs": {
                 **guide_defaults,
                 "positive": ["362", 0], "negative": ["362", 1],
                 "latent": ["362", 2], "image": ["359", 0],
+                "frame_idx": end_hold_frame, "strength": end_strength,
+            }},
+            "363": {"class_type": "LTXVAddGuide", "inputs": {
+                **guide_defaults,
+                "positive": ["366", 0], "negative": ["366", 1],
+                "latent": ["366", 2], "image": ["359", 0],
                 "frame_idx": -1, "strength": end_strength,
             }},
         })
