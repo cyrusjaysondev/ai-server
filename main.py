@@ -38,6 +38,7 @@ from workflows import (
     build_flux_i2i_workflow,
     build_flux_multi_face_swap_workflow,
     build_t2i_workflow,
+    build_ltx_flf2v_workflow,
     build_ltx_i2v_workflow,
     build_ltx_lipdub_workflow,
     build_ltx_motion_workflow,
@@ -80,7 +81,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.3.9"
+API_VERSION = "2.4.0"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -1989,7 +1990,7 @@ async def get_ltx_presets():
             info[k] = {"mode": "two_pass", "low_res_steps": v["low_res_sigmas"].count(","), "high_res_steps": v["high_res_sigmas"].count(","), "lora_strength": v["lora_strength"]}
         else:
             info[k] = {"mode": "single_pass", "steps": v["sigmas"].count(","), "lora_strength": v["lora_strength"]}
-    return {"presets": info, "default": "fast", "endpoints": ["/ltx/i2v", "/ltx/t2v", "/face-animate"]}
+    return {"presets": info, "default": "fast", "endpoints": ["/ltx/i2v", "/ltx/flf2v", "/ltx/t2v", "/face-animate"]}
 
 
 # ─────────────────────────────────────────────
@@ -2049,6 +2050,135 @@ async def ltx_image_to_video(
     _reserve_video_job(job_id, [img_path])
     background_tasks.add_task(run_job, job_id, workflow, [img_path], watermark, watermark_image, caption=caption, caption_icon=caption_icon, caption_fade=caption_fade, background_music=background_music)
     return {"job_id": job_id, "status": "queued", "model": "ltx-2.3-22b", **_job_links(job_id)}
+
+
+# ─────────────────────────────────────────────
+# LTX-2.3 First + Last Frame to Video
+# ─────────────────────────────────────────────
+
+@app.post("/ltx/flf2v")
+async def ltx_first_last_frame_to_video(
+    background_tasks: BackgroundTasks,
+    first_image: UploadFile = File(..., description="Exact first frame"),
+    last_image: UploadFile = File(..., description="Exact last frame"),
+    prompt: str = Form("", description="Motion between the two supplied endpoint frames"),
+    negative_prompt: str = Form(LTX_DEFAULT_NEGATIVE),
+    preset: str = Form("fast", description="Speed/quality preset: realtime, fast, or quality"),
+    aspect_ratio: str = Form("9:16"),
+    width: int = Form(544),
+    height: int = Form(960),
+    length: int = Form(121),
+    fps: int = Form(24),
+    seed: int = Form(-1),
+    audio: bool = Form(False),
+    enhance_prompt: bool = Form(False, description="Use the first frame to expand a short prompt"),
+    start_strength: float = Form(1.0, ge=0.0, le=1.0),
+    end_strength: float = Form(1.0, ge=0.0, le=1.0),
+    watermark: str | None = Form(None),
+    watermark_image: bool = Form(False),
+    caption: str | None = Form(None),
+    caption_icon: str | None = Form(None),
+    caption_fade: bool = Form(True),
+    background_music: bool = Form(False),
+    face_filter: bool = Form(True),
+    require_detectable_face: bool = Form(False),
+):
+    if preset not in LTX_PRESETS:
+        raise HTTPException(400, f"Invalid preset '{preset}'. Valid: {', '.join(LTX_PRESETS)}")
+    if aspect_ratio != "original" and aspect_ratio not in LTX_ASPECT_RATIOS:
+        raise HTTPException(400, f"Invalid aspect_ratio. Valid: original, {', '.join(LTX_ASPECT_RATIOS)}")
+    if length < 9 or (length - 1) % 8 != 0:
+        raise HTTPException(400, "length must be 8n+1 and at least 9 frames")
+
+    seed = seed if seed != -1 else uuid.uuid4().int % 2**32
+    width, height = compute_ltx_dimensions(width, height, aspect_ratio)
+
+    import io
+    from PIL import Image as PILImage, UnidentifiedImageError
+
+    max_image_bytes = 20 * 1024 * 1024
+    max_image_pixels = 40_000_000
+
+    async def read_valid_image(upload: UploadFile, field_name: str) -> tuple[bytes, tuple[int, int]]:
+        data = await upload.read(max_image_bytes + 1)
+        if not data:
+            raise HTTPException(400, f"{field_name} is empty")
+        if len(data) > max_image_bytes:
+            raise HTTPException(413, f"{field_name} exceeds the 20 MB limit")
+        try:
+            with PILImage.open(io.BytesIO(data)) as decoded:
+                decoded.verify()
+            with PILImage.open(io.BytesIO(data)) as decoded:
+                image_size = decoded.size
+        except (PILImage.DecompressionBombError, UnidentifiedImageError, OSError, ValueError) as exc:
+            raise HTTPException(400, f"{field_name} is not a valid image") from exc
+        image_width, image_height = image_size
+        if image_width < 1 or image_height < 1 or image_width * image_height > max_image_pixels:
+            raise HTTPException(400, f"{field_name} exceeds the 40 megapixel limit")
+        return data, image_size
+
+    first_bytes, first_size = await read_valid_image(first_image, "first_image")
+    last_bytes, last_size = await read_valid_image(last_image, "last_image")
+    if first_size != last_size:
+        raise HTTPException(
+            400,
+            f"first_image and last_image must have identical dimensions; got {first_size} and {last_size}",
+        )
+    inputs = [(first_bytes, "first_image"), (last_bytes, "last_image")]
+    job_id = str(uuid.uuid4())
+    _require_detectable_face("/ltx/flf2v", require_detectable_face, inputs)
+    _apply_face_filter("/ltx/flf2v", job_id, face_filter, inputs)
+
+    first_filename = f"ltx_flf2v_first_{uuid.uuid4().hex}.png"
+    last_filename = f"ltx_flf2v_last_{uuid.uuid4().hex}.png"
+    first_path, last_path = str(INPUT_DIR / first_filename), str(INPUT_DIR / last_filename)
+    cleanup_paths: list[str] = []
+    try:
+        Path(first_path).write_bytes(first_bytes)
+        cleanup_paths.append(first_path)
+        Path(last_path).write_bytes(last_bytes)
+        cleanup_paths.append(last_path)
+
+        workflow = build_ltx_flf2v_workflow(
+            first_image_filename=first_filename,
+            last_image_filename=last_filename,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            width=width,
+            height=height,
+            length=length,
+            fps=fps,
+            seed=seed,
+            preset=preset,
+            audio=audio,
+            enhance_prompt=enhance_prompt,
+            start_strength=start_strength,
+            end_strength=end_strength,
+        )
+        _reserve_video_job(job_id, cleanup_paths)
+    except Exception:
+        for cleanup_path in cleanup_paths:
+            Path(cleanup_path).unlink(missing_ok=True)
+        raise
+    background_tasks.add_task(
+        run_job,
+        job_id,
+        workflow,
+        cleanup_paths,
+        watermark,
+        watermark_image,
+        caption=caption,
+        caption_icon=caption_icon,
+        caption_fade=caption_fade,
+        background_music=background_music,
+    )
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "model": "ltx-2.3-22b-keyframes",
+        "keyframes": [0, -1],
+        **_job_links(job_id),
+    }
 
 
 # ─────────────────────────────────────────────

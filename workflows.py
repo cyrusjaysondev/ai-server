@@ -916,6 +916,142 @@ def build_ltx_i2v_workflow(image_filename: str, prompt: str, negative_prompt: st
 
 
 # ─────────────────────────────────────────────
+# LTX-2.3 — First + last frame interpolation
+# ─────────────────────────────────────────────
+
+def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str,
+                             prompt: str, negative_prompt: str,
+                             width: int, height: int, length: int, fps: int, seed: int,
+                             preset: str = "fast", audio: bool = False,
+                             enhance_prompt: bool = False,
+                             start_strength: float = 1.0,
+                             end_strength: float = 1.0) -> dict:
+    """Build an LTX 2.3 first/last-frame interpolation workflow.
+
+    ComfyUI's built-in ``LTXVAddGuide`` appends the supplied endpoint
+    images to the latent. The guides must be chained and cropped after
+    sampling. The quality preset crops before upscale, then reapplies both
+    endpoint guides for the refine pass and crops once more before decode.
+    """
+    if preset not in LTX_PRESETS:
+        raise ValueError(f"invalid LTX preset: {preset}")
+    if length < 9 or (length - 1) % 8 != 0:
+        raise ValueError("first/last-frame video length must be 8n+1 and at least 9 frames")
+
+    two_pass = LTX_PRESETS[preset]["two_pass"]
+    low_width = max(32, (width // 2 // 32) * 32) if two_pass else width
+    low_height = max(32, (height // 2 // 32) * 32) if two_pass else height
+    guide_defaults = {"vae": ["236", 2]}
+
+    guide_nodes = {
+        "350": {"class_type": "LoadImage", "inputs": {"image": first_image_filename}},
+        "351": {"class_type": "LoadImage", "inputs": {"image": last_image_filename}},
+        "352": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["350", 0], "resize_type": "scale dimensions",
+            "resize_type.width": low_width, "resize_type.height": low_height,
+            "resize_type.crop": "center", "scale_method": "lanczos",
+        }},
+        "353": {"class_type": "ResizeImageMaskNode", "inputs": {
+            "input": ["351", 0], "resize_type": "scale dimensions",
+            "resize_type.width": low_width, "resize_type.height": low_height,
+            "resize_type.crop": "center", "scale_method": "lanczos",
+        }},
+        "354": {"class_type": "LTXVPreprocess", "inputs": {
+            "image": ["352", 0], "img_compression": 25,
+        }},
+        "355": {"class_type": "LTXVPreprocess", "inputs": {
+            "image": ["353", 0], "img_compression": 25,
+        }},
+        "360": {"class_type": "LTXVAddGuide", "inputs": {
+            **guide_defaults,
+            "positive": ["239", 0], "negative": ["239", 1],
+            "latent": ["228", 0], "image": ["354", 0],
+            "frame_idx": 0, "strength": start_strength,
+        }},
+        "361": {"class_type": "LTXVAddGuide", "inputs": {
+            **guide_defaults,
+            "positive": ["360", 0], "negative": ["360", 1],
+            "latent": ["360", 2], "image": ["355", 0],
+            "frame_idx": -1, "strength": end_strength,
+        }},
+    }
+
+    high_res_src = None
+    if two_pass:
+        guide_nodes.update({
+            "356": {"class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["350", 0], "resize_type": "scale dimensions",
+                "resize_type.width": width, "resize_type.height": height,
+                "resize_type.crop": "center", "scale_method": "lanczos",
+            }},
+            "357": {"class_type": "ResizeImageMaskNode", "inputs": {
+                "input": ["351", 0], "resize_type": "scale dimensions",
+                "resize_type.width": width, "resize_type.height": height,
+                "resize_type.crop": "center", "scale_method": "lanczos",
+            }},
+            "358": {"class_type": "LTXVPreprocess", "inputs": {
+                "image": ["356", 0], "img_compression": 25,
+            }},
+            "359": {"class_type": "LTXVPreprocess", "inputs": {
+                "image": ["357", 0], "img_compression": 25,
+            }},
+            "362": {"class_type": "LTXVAddGuide", "inputs": {
+                **guide_defaults,
+                "positive": ["212", 0], "negative": ["212", 1],
+                "latent": ["253", 0], "image": ["358", 0],
+                "frame_idx": 0, "strength": start_strength,
+            }},
+            "363": {"class_type": "LTXVAddGuide", "inputs": {
+                **guide_defaults,
+                "positive": ["362", 0], "negative": ["362", 1],
+                "latent": ["362", 2], "image": ["359", 0],
+                "frame_idx": -1, "strength": end_strength,
+            }},
+        })
+        high_res_src = ["363", 2]
+
+    workflow = ltx_base_nodes(
+        prompt, negative_prompt, width, height, length, fps, seed,
+        low_res_video_src=["361", 2], high_res_video_src=high_res_src,
+        prefix="ltx_flf2v", preset=preset, audio=audio,
+    )
+    workflow.update(guide_nodes)
+    workflow["231"]["inputs"]["positive"] = ["361", 0]
+    workflow["231"]["inputs"]["negative"] = ["361", 1]
+
+    if two_pass:
+        workflow["212"]["inputs"]["positive"] = ["361", 0]
+        workflow["212"]["inputs"]["negative"] = ["361", 1]
+        workflow["253"]["inputs"]["samples"] = ["212", 2]
+        workflow["213"]["inputs"]["positive"] = ["363", 0]
+        workflow["213"]["inputs"]["negative"] = ["363", 1]
+
+    final_positive = ["363", 0] if two_pass else ["361", 0]
+    final_negative = ["363", 1] if two_pass else ["361", 1]
+    final_sample = (["218", 0] if audio else ["219", 0]) if two_pass else (["217", 0] if audio else ["215", 0])
+    workflow["364"] = {"class_type": "LTXVCropGuides", "inputs": {
+        "positive": final_positive,
+        "negative": final_negative,
+        "latent": final_sample,
+    }}
+    workflow["251"]["inputs"]["samples"] = ["364", 2]
+
+    if enhance_prompt:
+        workflow["274"] = {"class_type": "TextGenerateLTX2Prompt", "inputs": {
+            "clip": ["272", 1], "image": ["350", 0], "prompt": prompt,
+            "max_length": 256, "sampling_mode": "on",
+            "sampling_mode.temperature": 0.7, "sampling_mode.top_k": 64,
+            "sampling_mode.top_p": 0.95, "sampling_mode.min_p": 0.05,
+            "sampling_mode.repetition_penalty": 1.05, "sampling_mode.seed": seed,
+        }}
+        workflow["240"] = {"class_type": "CLIPTextEncode", "inputs": {
+            "clip": ["243", 0], "text": ["274", 0],
+        }}
+
+    return workflow
+
+
+# ─────────────────────────────────────────────
 # LTX-2.3 — Text to Video (workflow assembly)
 # ─────────────────────────────────────────────
 
