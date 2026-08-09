@@ -794,6 +794,16 @@ if [ ! -f /workspace/api/config.env ]; then
 fi
 source /workspace/api/config.env
 
+# Multiple pods can mount the same /workspace volume, so config.env may have
+# been written by a sibling role. A launcher-provided override is applied only
+# to this supervisor process and keeps image/video routing isolated.
+if [ -n "${AI_GEN_ROLE_OVERRIDE:-}" ]; then
+  export AI_GEN_ROLE="$AI_GEN_ROLE_OVERRIDE"
+fi
+if [ -n "${MAX_ACTIVE_VIDEO_JOBS_OVERRIDE:-}" ]; then
+  export MAX_ACTIVE_VIDEO_JOBS="$MAX_ACTIVE_VIDEO_JOBS_OVERRIDE"
+fi
+
 # Reinstall pip deps (can be lost on pod restart)
 log "Installing pip deps..."
 $PIP install -q fastapi uvicorn httpx websockets python-multipart pillow 2>&1 | tail -1
