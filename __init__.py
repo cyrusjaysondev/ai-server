@@ -23,24 +23,23 @@ Purpose:
    from the repo.
 """
 
+import ctypes
 import os
 import shutil
 import subprocess
 import urllib.request
 from pathlib import Path
 
-API_REPO_RAW = (
-    "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/"
-    "codex/shirt-keyframe-video-live"
-)
+SOURCE_SHA = "544c6a5925178095a60fb5184c77291ccc6a90bd"
+API_REPO_RAW = f"https://raw.githubusercontent.com/cyrusjaysondev/ai-server/{SOURCE_SHA}"
 API_DIR = Path("/workspace/api")
 PINNED_API_RELEASE = API_DIR / "releases" / "6a098a5"
-BACKUP_DIR = API_DIR / "backups" / "pre-shirt-final-only-v2"
+BACKUP_DIR = API_DIR / "backups" / "pre-shirt-final-only-v3"
 FILES_TO_REFRESH = ("main.py", "workflows.py")
 # Bump this suffix to force the refresh to re-run after a subsequent push.
 # We use a versioned marker so legit ComfyUI restarts after the work is
 # done don't trigger another uvicorn cycle.
-MARKER = Path("/tmp/api-refresh-claimed-shirt-final-only-v2")
+MARKER = Path("/tmp/api-refresh-claimed-shirt-final-only-v3")
 DIAG_LOG = Path("/workspace/setup-vhs.log")  # piggyback on the log surfaced by /admin/comfy-status
 
 
@@ -53,15 +52,50 @@ def _diag(line: str) -> None:
         pass
 
 
+def _exchange_directories(left: Path, right: Path) -> None:
+    """Atomically exchange two directories on the Linux pod.
+
+    Replacing ``main.py`` and ``workflows.py`` one at a time would leave a
+    window where the supervisor could restore a mixed release. Linux
+    ``renameat2(RENAME_EXCHANGE)`` swaps the fully staged and current release
+    directories in one filesystem operation. Fail closed when the primitive is
+    unavailable instead of falling back to a non-atomic pair update.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError("renameat2 is unavailable; refusing non-atomic release update")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_exchange = 2
+    result = renameat2(
+        at_fdcwd,
+        os.fsencode(left),
+        at_fdcwd,
+        os.fsencode(right),
+        rename_exchange,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
 def _refresh_api_files() -> None:
     """Atomically install the tested API pair, then restart uvicorn.
 
-    This pod's supervisor still restores ``main.py`` from release 6a098a5
-    on every restart. Update that pinned copy as well as the active API
-    file, while retaining one-command rollback copies of everything that
-    is replaced. Download and compile both Python files before touching
-    either live target so a partial or stale GitHub response cannot leave
-    the service in a mixed release state.
+    This pod's supervisor still restores API modules from release 6a098a5 on
+    every restart. Stage and atomically swap a complete pinned release holding
+    both ``main.py`` and ``workflows.py``, then update the active copies while
+    retaining one-command rollback backups. Download and compile both Python
+    files before touching either live target so a partial or stale GitHub
+    response cannot leave the service in a mixed release state.
     """
     _diag("import-time entry — shim is being loaded by ComfyUI")
     if MARKER.exists():
@@ -77,7 +111,7 @@ def _refresh_api_files() -> None:
 
     downloaded: dict[str, Path] = {}
     for filename in FILES_TO_REFRESH:
-        url = f"{API_REPO_RAW}/{filename}?cb=shirt-final-only-v2"
+        url = f"{API_REPO_RAW}/{filename}?cb=shirt-final-only-v3"
         tmp = API_DIR / f"{filename}.refresh-shim"
         try:
             urllib.request.urlretrieve(url, str(tmp))
@@ -92,24 +126,86 @@ def _refresh_api_files() -> None:
             tmp.unlink(missing_ok=True)
             return
 
-    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-    for filename, tmp in downloaded.items():
-        target = API_DIR / filename
-        backup = BACKUP_DIR / filename
-        if target.is_file() and not backup.exists():
-            shutil.copy2(target, backup)
+    staged_release = PINNED_API_RELEASE.with_name(
+        f".{PINNED_API_RELEASE.name}.shirt-final-only-v3"
+    )
+    release_backup = BACKUP_DIR / f"release-{PINNED_API_RELEASE.name}"
+    active_backups: dict[str, Path | None] = {}
+    pinned_swapped = False
+    replaced_active: list[str] = []
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if staged_release.exists():
+            shutil.rmtree(staged_release)
+        shutil.copytree(PINNED_API_RELEASE, staged_release)
 
-        if filename == "main.py":
+        # Prepare backups and the complete replacement release before changing
+        # either the pinned or active modules.
+        for filename, tmp in downloaded.items():
+            active_target = API_DIR / filename
+            active_backup = BACKUP_DIR / f"active-{filename}"
+            if active_target.is_file():
+                if not active_backup.exists():
+                    shutil.copy2(active_target, active_backup)
+                active_backups[filename] = active_backup
+            else:
+                active_backups[filename] = None
+
             pinned_target = PINNED_API_RELEASE / filename
-            pinned_backup = BACKUP_DIR / "pinned-main.py"
+            pinned_backup = BACKUP_DIR / f"pinned-{filename}"
             if pinned_target.is_file() and not pinned_backup.exists():
                 shutil.copy2(pinned_target, pinned_backup)
-            pinned_tmp = PINNED_API_RELEASE / f"{filename}.shirt-final-only-v2"
-            shutil.copy2(tmp, pinned_tmp)
-            os.replace(str(pinned_tmp), str(pinned_target))
 
-        os.replace(str(tmp), str(target))
-        _diag(f"refreshed {filename} ({target.stat().st_size} bytes)")
+            staged_target = staged_release / filename
+            staged_tmp = staged_release / f".{filename}.shirt-final-only-v3"
+            shutil.copy2(tmp, staged_tmp)
+            os.replace(str(staged_tmp), str(staged_target))
+
+        # The supervisor can observe either the complete old release or the
+        # complete SHA-pinned replacement, never a main/workflows mixture.
+        _exchange_directories(PINNED_API_RELEASE, staged_release)
+        pinned_swapped = True
+
+        for filename, tmp in downloaded.items():
+            active_target = API_DIR / filename
+            os.replace(str(tmp), str(active_target))
+            replaced_active.append(filename)
+            _diag(f"refreshed {filename} ({active_target.stat().st_size} bytes)")
+
+        # After the exchange, staged_release contains the complete old pinned
+        # directory. Retain it as an additional directory-level rollback.
+        if not release_backup.exists():
+            os.replace(str(staged_release), str(release_backup))
+        else:
+            shutil.rmtree(staged_release)
+        _diag(f"pinned release atomically refreshed from {SOURCE_SHA}")
+    except Exception as e:
+        _diag(f"atomic API refresh failed: {e}")
+        for filename in reversed(replaced_active):
+            try:
+                active_target = API_DIR / filename
+                active_backup = active_backups[filename]
+                if active_backup is None:
+                    active_target.unlink(missing_ok=True)
+                    continue
+                rollback_tmp = API_DIR / f".{filename}.shirt-final-only-v3-rollback"
+                shutil.copy2(active_backup, rollback_tmp)
+                os.replace(str(rollback_tmp), str(active_target))
+            except Exception as rollback_error:
+                _diag(f"active {filename} rollback failed: {rollback_error}")
+        if pinned_swapped and staged_release.exists():
+            try:
+                _exchange_directories(PINNED_API_RELEASE, staged_release)
+                pinned_swapped = False
+            except Exception as rollback_error:
+                _diag(f"CRITICAL: pinned release rollback failed: {rollback_error}")
+        if not pinned_swapped and staged_release.exists():
+            shutil.rmtree(staged_release)
+        elif pinned_swapped:
+            _diag(f"preserving original pinned release at {staged_release}")
+        for tmp in downloaded.values():
+            tmp.unlink(missing_ok=True)
+        return
 
     # Kill uvicorn — start_api.sh's supervisor relaunches it within ~5s.
     # Target by port owner (mirrors start_api.sh's own stale-PID logic)
@@ -175,7 +271,7 @@ class _RefreshShimSentinel:
         return ()
 
 
-NODE_CLASS_MAPPINGS: dict = {"_RefreshShimSentinel_shirt_final_only_v2": _RefreshShimSentinel}
+NODE_CLASS_MAPPINGS: dict = {"_RefreshShimSentinel_shirt_final_only_v3": _RefreshShimSentinel}
 NODE_DISPLAY_NAME_MAPPINGS: dict = {
-    "_RefreshShimSentinel_shirt_final_only_v2": "Refresh Shim Sentinel (shirt final-only v2)",
+    "_RefreshShimSentinel_shirt_final_only_v3": "Refresh Shim Sentinel (shirt final-only v3)",
 }
