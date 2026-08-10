@@ -29,15 +29,18 @@ import subprocess
 import urllib.request
 from pathlib import Path
 
-API_REPO_RAW = "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/main"
+API_REPO_RAW = (
+    "https://raw.githubusercontent.com/cyrusjaysondev/ai-server/"
+    "codex/shirt-keyframe-video-live"
+)
 API_DIR = Path("/workspace/api")
-PINNED_API_RELEASE = API_DIR / "releases" / "0b88fac"
-BACKUP_DIR = API_DIR / "backups" / "pre-shirt-keyframe-v1"
+PINNED_API_RELEASE = API_DIR / "releases" / "6a098a5"
+BACKUP_DIR = API_DIR / "backups" / "pre-shirt-final-only-v2"
 FILES_TO_REFRESH = ("main.py", "workflows.py")
 # Bump this suffix to force the refresh to re-run after a subsequent push.
 # We use a versioned marker so legit ComfyUI restarts after the work is
 # done don't trigger another uvicorn cycle.
-MARKER = Path("/tmp/api-refresh-claimed-shirt-keyframe-v1")
+MARKER = Path("/tmp/api-refresh-claimed-shirt-final-only-v2")
 DIAG_LOG = Path("/workspace/setup-vhs.log")  # piggyback on the log surfaced by /admin/comfy-status
 
 
@@ -53,7 +56,7 @@ def _diag(line: str) -> None:
 def _refresh_api_files() -> None:
     """Atomically install the tested API pair, then restart uvicorn.
 
-    This pod's supervisor still restores ``main.py`` from release 0b88fac
+    This pod's supervisor still restores ``main.py`` from release 6a098a5
     on every restart. Update that pinned copy as well as the active API
     file, while retaining one-command rollback copies of everything that
     is replaced. Download and compile both Python files before touching
@@ -74,7 +77,7 @@ def _refresh_api_files() -> None:
 
     downloaded: dict[str, Path] = {}
     for filename in FILES_TO_REFRESH:
-        url = f"{API_REPO_RAW}/{filename}?cb=shirt-keyframe-v1"
+        url = f"{API_REPO_RAW}/{filename}?cb=shirt-final-only-v2"
         tmp = API_DIR / f"{filename}.refresh-shim"
         try:
             urllib.request.urlretrieve(url, str(tmp))
@@ -101,7 +104,7 @@ def _refresh_api_files() -> None:
             pinned_backup = BACKUP_DIR / "pinned-main.py"
             if pinned_target.is_file() and not pinned_backup.exists():
                 shutil.copy2(pinned_target, pinned_backup)
-            pinned_tmp = PINNED_API_RELEASE / f"{filename}.shirt-keyframe-v1"
+            pinned_tmp = PINNED_API_RELEASE / f"{filename}.shirt-final-only-v2"
             shutil.copy2(tmp, pinned_tmp)
             os.replace(str(pinned_tmp), str(pinned_target))
 
@@ -172,7 +175,7 @@ class _RefreshShimSentinel:
         return ()
 
 
-NODE_CLASS_MAPPINGS: dict = {"_RefreshShimSentinel_shirt_keyframe_v1": _RefreshShimSentinel}
+NODE_CLASS_MAPPINGS: dict = {"_RefreshShimSentinel_shirt_final_only_v2": _RefreshShimSentinel}
 NODE_DISPLAY_NAME_MAPPINGS: dict = {
-    "_RefreshShimSentinel_shirt_keyframe_v1": "Refresh Shim Sentinel (shirt keyframe v1)",
+    "_RefreshShimSentinel_shirt_final_only_v2": "Refresh Shim Sentinel (shirt final-only v2)",
 }
