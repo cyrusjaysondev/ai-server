@@ -761,20 +761,24 @@ def ltx_end_hold_frame_index(
     length: int,
     fps: int,
     end_hold_seconds: float = 1.0,
-) -> int:
-    """Return the first frame pinned to the final image before frame ``-1``.
+) -> int | None:
+    """Return the optional early final-image guide frame before frame ``-1``.
 
     LTX can satisfy a last-frame guide only at the very end while drifting or
     morphing immediately beforehand. Repeating the final-image guide one second
     earlier gives the sampler a stable held endpoint. Very short clips clamp the
     hold start to frame 1 so the first-frame guide at frame 0 remains distinct.
+    ``end_hold_seconds=0`` disables that duplicate guide and returns ``None``;
+    the true final-frame guide remains active.
     """
     if length < 9 or (length - 1) % 8 != 0:
         raise ValueError("first/last-frame video length must be 8n+1 and at least 9 frames")
     if fps < 1:
         raise ValueError("first/last-frame video fps must be at least 1")
-    if end_hold_seconds <= 0:
-        raise ValueError("end_hold_seconds must be greater than 0")
+    if end_hold_seconds < 0:
+        raise ValueError("end_hold_seconds must be at least 0")
+    if end_hold_seconds == 0:
+        return None
     hold_frames = max(1, int(round(float(end_hold_seconds) * fps)))
     return max(1, (length - 1) - hold_frames)
 
@@ -1042,9 +1046,11 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
     ComfyUI's built-in ``LTXVAddGuide`` appends the supplied endpoint images
     to the latent. The guides must be chained and cropped after sampling. The
     final image is pinned both at the start of a one-second end hold and again
-    at frame ``-1`` so the model cannot morph immediately before the endpoint.
-    The quality preset crops before upscale, then reapplies all three guides
-    for the refine pass and crops once more before decode.
+    at frame ``-1`` by default so the model cannot morph immediately before the
+    endpoint. Set ``end_hold_seconds=0`` to omit the early duplicate and guide
+    only the true final frame. The quality preset crops before upscale, then
+    reapplies the same two- or three-guide chain for the refine pass and crops
+    once more before decode.
     """
     if preset not in LTX_PRESETS:
         raise ValueError(f"invalid LTX preset: {preset}")
@@ -1080,19 +1086,23 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
             "latent": ["228", 0], "image": ["354", 0],
             "frame_idx": 0, "strength": start_strength,
         }},
-        "365": {"class_type": "LTXVAddGuide", "inputs": {
+    }
+
+    low_final_input = "360"
+    if end_hold_frame is not None:
+        guide_nodes["365"] = {"class_type": "LTXVAddGuide", "inputs": {
             **guide_defaults,
             "positive": ["360", 0], "negative": ["360", 1],
             "latent": ["360", 2], "image": ["355", 0],
             "frame_idx": end_hold_frame, "strength": end_strength,
-        }},
-        "361": {"class_type": "LTXVAddGuide", "inputs": {
-            **guide_defaults,
-            "positive": ["365", 0], "negative": ["365", 1],
-            "latent": ["365", 2], "image": ["355", 0],
-            "frame_idx": -1, "strength": end_strength,
-        }},
-    }
+        }}
+        low_final_input = "365"
+    guide_nodes["361"] = {"class_type": "LTXVAddGuide", "inputs": {
+        **guide_defaults,
+        "positive": [low_final_input, 0], "negative": [low_final_input, 1],
+        "latent": [low_final_input, 2], "image": ["355", 0],
+        "frame_idx": -1, "strength": end_strength,
+    }}
 
     high_res_src = None
     if two_pass:
@@ -1119,19 +1129,22 @@ def build_ltx_flf2v_workflow(first_image_filename: str, last_image_filename: str
                 "latent": ["253", 0], "image": ["358", 0],
                 "frame_idx": 0, "strength": start_strength,
             }},
-            "366": {"class_type": "LTXVAddGuide", "inputs": {
+        })
+        high_final_input = "362"
+        if end_hold_frame is not None:
+            guide_nodes["366"] = {"class_type": "LTXVAddGuide", "inputs": {
                 **guide_defaults,
                 "positive": ["362", 0], "negative": ["362", 1],
                 "latent": ["362", 2], "image": ["359", 0],
                 "frame_idx": end_hold_frame, "strength": end_strength,
-            }},
-            "363": {"class_type": "LTXVAddGuide", "inputs": {
-                **guide_defaults,
-                "positive": ["366", 0], "negative": ["366", 1],
-                "latent": ["366", 2], "image": ["359", 0],
-                "frame_idx": -1, "strength": end_strength,
-            }},
-        })
+            }}
+            high_final_input = "366"
+        guide_nodes["363"] = {"class_type": "LTXVAddGuide", "inputs": {
+            **guide_defaults,
+            "positive": [high_final_input, 0], "negative": [high_final_input, 1],
+            "latent": [high_final_input, 2], "image": ["359", 0],
+            "frame_idx": -1, "strength": end_strength,
+        }}
         high_res_src = ["363", 2]
 
     workflow = ltx_base_nodes(

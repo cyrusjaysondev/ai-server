@@ -83,7 +83,7 @@ except ImportError:
 
 app = FastAPI(title="AI Gen API v2")
 
-API_VERSION = "2.4.1"
+API_VERSION = "2.4.2"
 
 # Open CORS so browser-based admin UIs (super-cms-vn /ai-pods + /blocked-faces)
 # can call /admin/blocklist directly across the multi-pod registry. We
@@ -2058,9 +2058,12 @@ async def ltx_first_last_frame_to_video(
     end_strength: float = Form(1.0, ge=0.0, le=1.0),
     end_hold_seconds: float = Form(
         1.0,
-        gt=0.0,
+        ge=0.0,
         le=4.0,
-        description="Seconds to hold the supplied last frame before the video ends",
+        description=(
+            "Seconds before the end to add a duplicate last-frame guide; "
+            "set 0 to guide only the true final frame"
+        ),
     ),
     watermark: str | None = Form(None),
     watermark_image: bool = Form(False),
@@ -2161,15 +2164,13 @@ async def ltx_first_last_frame_to_video(
         caption_fade=caption_fade,
         background_music=background_music,
     )
+    end_hold_frame = ltx_end_hold_frame_index(length, fps, end_hold_seconds)
+    keyframes = [0, -1] if end_hold_frame is None else [0, end_hold_frame, -1]
     return {
         "job_id": job_id,
         "status": "queued",
         "model": "ltx-2.3-22b-keyframes",
-        "keyframes": [
-            0,
-            ltx_end_hold_frame_index(length, fps, end_hold_seconds),
-            -1,
-        ],
+        "keyframes": keyframes,
         "end_hold_seconds": end_hold_seconds,
         **_job_links(job_id),
     }
